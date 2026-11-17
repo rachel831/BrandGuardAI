@@ -5,7 +5,7 @@ import {
   Ban, RefreshCw, Power, FileText, LogOut, UserPlus, LockKeyhole
 } from "lucide-react";
 
-const API = "http://127.0.0.1:8000";
+const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
 const TOKEN_KEY = "brandguard_token";
 const blankGuideline = { brand_name:"", tone_of_voice:"", approved_colors:[], restricted_terms:[], approved_claims:[], approved_terms:[], required_terms:[], brand_facts:[], logo_url:"", logo_filename:"" };
 const arr = v => Array.isArray(v) ? v : [];
