@@ -4,7 +4,16 @@ from typing import Optional
 import base64, hashlib, hmac, io, json, os, re, secrets, sqlite3
 from difflib import get_close_matches
 
-import easyocr
+import pytesseract
+from pytesseract import Output
+tesseract_path = os.getenv("TESSERACT_CMD")
+
+if tesseract_path:
+    pytesseract.pytesseract.tesseract_cmd = tesseract_path
+elif os.name == "nt":
+    windows_tesseract = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    if os.path.exists(windows_tesseract):
+        pytesseract.pytesseract.tesseract_cmd = windows_tesseract
 import numpy as np
 try:
     import cv2
@@ -142,9 +151,7 @@ def initialize_database():
     con.close()
 
 initialize_database()
-print("Loading BrandGuard AI OCR model...")
-reader = easyocr.Reader(["en"], gpu=False)
-print("OCR model loaded successfully!")
+
 
 
 app = FastAPI(title="BrandGuard AI")
@@ -804,40 +811,89 @@ def check_poster_brand_name(expected_brand_name, ocr_results, image_size=None):
     return {"status": "Unable to verify", "expected_brand": expected_display, "detected_text": "",
             "note": f'The official name "{expected_display}" was not found clearly enough in OCR. This is not proof of a mismatch; verify the poster manually.'}
 
+
 def run_improved_ocr(image):
-    """Run OCR on original and enhanced/upscaled copies, merge duplicate detections."""
+    """Run lightweight Tesseract OCR on original and enhanced images."""
     original = image.convert("RGB")
     w, h = original.size
+
     enhanced = ImageOps.autocontrast(original.convert("L")).convert("RGB")
     enhanced = ImageEnhance.Sharpness(enhanced).enhance(1.6)
     enhanced = ImageEnhance.Contrast(enhanced).enhance(1.25)
-    # Upscaling helps small text. Limit the longest side to avoid excessive memory use.
+
     scale = min(1.8, 2400 / max(w, h, 1))
+
     if scale > 1.02:
-        enhanced = enhanced.resize((max(1, int(w * scale)), max(1, int(h * scale))), getattr(Image, "Resampling", Image).LANCZOS)
-    candidates = [(np.array(original), 1.0), (np.array(enhanced), scale if scale > 1.02 else 1.0)]
+        enhanced = enhanced.resize(
+            (max(1, int(w * scale)), max(1, int(h * scale))),
+            getattr(Image, "Resampling", Image).LANCZOS
+        )
+
+    candidates = [
+        (np.array(original), 1.0),
+        (np.array(enhanced), scale if scale > 1.02 else 1.0)
+    ]
+
     merged = {}
+
     for arr_img, factor in candidates:
         try:
-            detections = reader.readtext(arr_img, detail=1, paragraph=False)
-        except Exception:
+            data = pytesseract.image_to_data(
+                arr_img,
+                output_type=Output.DICT,
+                config="--psm 11"
+            )
+        except Exception as e:
+            print("OCR error:", e)
             continue
-        for box, txt, confidence in detections:
+
+        for i, txt in enumerate(data["text"]):
             text_value = str(txt).strip()
+
             if not text_value:
                 continue
+
+            try:
+                confidence = float(data["conf"][i]) / 100
+            except (ValueError, TypeError):
+                continue
+
+            if confidence < 0:
+                continue
+
+            x = float(data["left"][i]) / factor
+            y = float(data["top"][i]) / factor
+            width = float(data["width"][i]) / factor
+            height = float(data["height"][i]) / factor
+
+            box = [
+                [x, y],
+                [x + width, y],
+                [x + width, y + height],
+                [x, y + height]
+            ]
+
             key = re.sub(r"\W+", "", text_value.casefold())
+
             if not key:
                 continue
-            # Convert enhanced-image coordinates back to the original image coordinate space.
-            coords = [[float(p[0]) / factor, float(p[1]) / factor] for p in box]
-            candidate = (coords, text_value, float(confidence))
-            if key not in merged or candidate[2] > merged[key][2]:
+
+            candidate = (box, text_value, confidence)
+
+            if key not in merged or confidence > merged[key][2]:
                 merged[key] = candidate
+
     results = list(merged.values())
-    # Stable top-to-bottom, then left-to-right reading order.
-    results.sort(key=lambda item: (min(p[1] for p in item[0]), min(p[0] for p in item[0])))
+
+    results.sort(
+        key=lambda item: (
+            min(p[1] for p in item[0]),
+            min(p[0] for p in item[0])
+        )
+    )
+
     return results
+
 
 @app.post("/analyze-image")
 async def analyze_image(file: UploadFile = File(...), user=Depends(current_user)):
