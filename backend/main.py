@@ -15,10 +15,23 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+
 BASE_DIR = Path(__file__).resolve().parent
-DB_NAME = BASE_DIR / "brandguard.db"
-TOKEN_SECRET = os.getenv("BRANDGUARD_SECRET_KEY", "CHANGE-THIS-DEVELOPMENT-SECRET-BEFORE-DEPLOYMENT")
+
+# Use Render persistent storage when configured; otherwise use local database.
+DATA_DIR = Path(os.getenv("BRANDGUARD_DATA_DIR", str(BASE_DIR)))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+DB_NAME = DATA_DIR / "brandguard.db"
+
+# Use a secure environment variable in deployment.
+TOKEN_SECRET = os.getenv(
+    "BRANDGUARD_SECRET_KEY",
+    "CHANGE-THIS-DEVELOPMENT-SECRET-BEFORE-DEPLOYMENT"
+)
+
 TOKEN_HOURS = 24 * 7
+
 
 def get_connection():
     con = sqlite3.connect(DB_NAME)
@@ -133,10 +146,21 @@ print("Loading BrandGuard AI OCR model...")
 reader = easyocr.Reader(["en"], gpu=False)
 print("OCR model loaded successfully!")
 
+
 app = FastAPI(title="BrandGuard AI")
-app.add_middleware(CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_methods=["*"], allow_headers=["*"])
+
+allowed_origins = os.getenv(
+    "FRONTEND_URLS",
+    "http://localhost:5173,http://127.0.0.1:5173"
+).split(",")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[origin.strip() for origin in allowed_origins if origin.strip()],
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
 
 class RegisterRequest(BaseModel):
     name: str = Field(min_length=2, max_length=100)
