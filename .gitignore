@@ -1,0 +1,39 @@
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Databases and backups
+*.db
+*.sqlite
+*.sqlite3
+*.db-*
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Python test/cache files
+.pytest_cache/
+.mypy_cache/
+.coverage
+
+# Node
+node_modules/
+dist/
+build/
+
+# Editor and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
