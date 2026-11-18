@@ -624,80 +624,215 @@ def assess_poster_readability(image_array, ocr_results):
         "note": "These are automated estimates, not a guarantee of accessibility or exact font-size measurement."}
 
 
-def compare_poster_logo(poster_image, logo_bytes):
-    """Compare the saved brand logo with a poster using ORB features and a scale search.
 
-    This is a visual similarity aid, not a legal/identity guarantee. It tolerates
-    common resizing and position changes, but large rotations, recolouring or
-    heavy stylisation can reduce confidence.
-    """
+def compare_poster_logo(poster_image, logo_bytes):
+    """Conservative logo comparison using ORB and geometric verification."""
+
     if not logo_bytes:
-        return {"status": "Not configured", "score": 0, "matched_features": 0,
-                "note": "No official logo is saved in the active Brand Guidelines."}
+        return {
+            "status": "Not configured",
+            "score": 0,
+            "matched_features": 0,
+            "note": "No official logo is saved."
+        }
+
     if cv2 is None:
-        return {"status": "Unavailable", "score": 0, "matched_features": 0,
-                "note": "OpenCV is not installed. Install opencv-python-headless to enable logo comparison."}
+        return {
+            "status": "Unavailable",
+            "score": 0,
+            "matched_features": 0,
+            "note": "OpenCV is not installed."
+        }
+
     try:
+        # Prepare poster
         poster = np.array(poster_image.convert("RGB"))
         poster_gray = cv2.cvtColor(poster, cv2.COLOR_RGB2GRAY)
+
+        # Prepare official logo
         logo_pil = Image.open(io.BytesIO(logo_bytes)).convert("RGBA")
-        # Trim transparent padding so the logo's actual artwork is compared.
-        alpha = logo_pil.getchannel("A")
-        bbox = alpha.getbbox()
+        bbox = logo_pil.getchannel("A").getbbox()
+
         if bbox:
             logo_pil = logo_pil.crop(bbox)
+
         white = Image.new("RGBA", logo_pil.size, (255, 255, 255, 255))
         white.alpha_composite(logo_pil)
+
         logo_rgb = np.array(white.convert("RGB"))
         logo_gray = cv2.cvtColor(logo_rgb, cv2.COLOR_RGB2GRAY)
-        # ORB keypoints are robust to moderate size and location changes.
-        orb = cv2.ORB_create(nfeatures=1800, scaleFactor=1.2, nlevels=8)
+
+        # Detect distinctive features
+        orb = cv2.ORB_create(
+            nfeatures=2500,
+            scaleFactor=1.2,
+            nlevels=8
+        )
+
         kp_logo, des_logo = orb.detectAndCompute(logo_gray, None)
         kp_poster, des_poster = orb.detectAndCompute(poster_gray, None)
-        good = []
-        inliers = 0
-        if des_logo is not None and des_poster is not None and len(kp_logo) >= 4 and len(kp_poster) >= 4:
-            matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
-            pairs = matcher.knnMatch(des_logo, des_poster, k=2)
-            good = [m for pair in pairs if len(pair) == 2 for m, n in [pair] if m.distance < 0.76 * n.distance]
-            if len(good) >= 4:
-                src = np.float32([kp_logo[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-                dst = np.float32([kp_poster[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-                _, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
-                inliers = int(mask.ravel().sum()) if mask is not None else 0
-        feature_score = round(min(100, (inliers / max(8, min(len(kp_logo), 30))) * 100))
-        if inliers >= 10:
-            return {"status": "Likely match", "score": feature_score, "matched_features": inliers,
-                    "note": "Several distinctive logo features were found in the poster. Check the highlighted result visually before approval.", "method": "ORB feature matching"}
-        if inliers >= 5:
-            return {"status": "Possible match", "score": feature_score, "matched_features": inliers,
-                    "note": "Some logo features were found, but the match is not strong enough for an automatic conclusion. Please review manually.", "method": "ORB feature matching"}
 
-        # Fallback for simple logos with few keypoints: compare the logo at
-        # several plausible poster sizes using normalized correlation.
-        best = -1.0
-        ph, pw = poster_gray.shape[:2]
+        if des_logo is None or des_poster is None:
+            return {
+                "status": "Not detected",
+                "score": 0,
+                "matched_features": 0,
+                "note": "Not enough distinctive logo features were detected."
+            }
+
+        if len(kp_logo) < 6 or len(kp_poster) < 6:
+            return {
+                "status": "Not detected",
+                "score": 0,
+                "matched_features": 0,
+                "note": "Insufficient visual features for reliable logo comparison."
+            }
+
+        # Match distinctive features
+        matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+
+        pairs = matcher.knnMatch(des_logo, des_poster, k=2)
+
+        good = [
+            m for pair in pairs
+            if len(pair) == 2
+            for m, n in [pair]
+            if m.distance < 0.70 * n.distance
+        ]
+
+        if len(good) < 6:
+            return {
+                "status": "Not detected",
+                "score": 0,
+                "matched_features": len(good),
+                "note": "The official logo was not confidently detected."
+            }
+
+        # Verify that matched features form the same geometric shape
+        src = np.float32([
+            kp_logo[m.queryIdx].pt for m in good
+        ]).reshape(-1, 1, 2)
+
+        dst = np.float32([
+            kp_poster[m.trainIdx].pt for m in good
+        ]).reshape(-1, 1, 2)
+
+        H, mask = cv2.findHomography(
+            src, dst, cv2.RANSAC, 4.0
+        )
+
+        if H is None or mask is None:
+            return {
+                "status": "Not detected",
+                "score": 0,
+                "matched_features": 0,
+                "note": "No reliable geometric logo match was found."
+            }
+
+        inlier_mask = mask.ravel().astype(bool)
+        inliers = int(np.sum(inlier_mask))
+        inlier_ratio = inliers / len(good)
+
+        # Check how much of the official logo is represented
+        logo_points = src[inlier_mask].reshape(-1, 2)
+
+        if len(logo_points) < 6:
+            return {
+                "status": "Not detected",
+                "score": 0,
+                "matched_features": inliers,
+                "note": "Too few reliable logo features were found."
+            }
+
+        hull = cv2.convexHull(
+            logo_points.astype(np.float32)
+        )
+
+        logo_area = max(
+            1, logo_gray.shape[0] * logo_gray.shape[1]
+        )
+
+        coverage = cv2.contourArea(hull) / logo_area
+
+        # Validate projected logo position and shape
         lh, lw = logo_gray.shape[:2]
-        for width_ratio in (0.10, 0.14, 0.18, 0.22, 0.28, 0.36, 0.45, 0.55, 0.68):
-            target_w = int(pw * width_ratio)
-            target_h = int(target_w * lh / max(1, lw))
-            if target_w < 12 or target_h < 12 or target_w > pw or target_h > ph:
-                continue
-            template = cv2.resize(logo_gray, (target_w, target_h), interpolation=cv2.INTER_AREA)
-            if float(np.std(template)) < 2:
-                continue
-            result = cv2.matchTemplate(poster_gray, template, cv2.TM_CCOEFF_NORMED)
-            _, value, _, _ = cv2.minMaxLoc(result)
-            best = max(best, float(value))
-        if best >= 0.84:
-            return {"status": "Possible match", "score": round(best * 100), "matched_features": 0,
-                    "note": "A similar logo-shaped image region was found. Correlation matching is less reliable than feature matching; confirm manually.", "method": "Multi-scale image correlation"}
-        return {"status": "Not detected", "score": round(max(0, best) * 100), "matched_features": inliers,
-                "note": "The official logo was not confidently located. It may be missing, heavily modified, recoloured or too small to recognise. A human reviewer must confirm.", "method": "ORB + multi-scale image correlation"}
-    except Exception as exc:
-        return {"status": "Unable to compare", "score": 0, "matched_features": 0,
-                "note": f"Logo comparison could not be completed: {str(exc)[:180]}"}
+        ph, pw = poster_gray.shape[:2]
 
+        corners = np.float32([
+            [0, 0],
+            [lw - 1, 0],
+            [lw - 1, lh - 1],
+            [0, lh - 1]
+        ]).reshape(-1, 1, 2)
+
+        projected = cv2.perspectiveTransform(corners, H)
+
+        center = np.mean(projected.reshape(-1, 2), axis=0)
+
+        center_valid = (
+            0 <= center[0] < pw and
+            0 <= center[1] < ph
+        )
+
+        polygon_area = abs(
+            cv2.contourArea(projected.astype(np.float32))
+        )
+
+        area_ratio = polygon_area / max(1, pw * ph)
+
+        geometry_valid = (
+            center_valid and
+            0.0001 < area_ratio < 0.60
+        )
+
+        # Conservative score: this is not a probability
+        score = round(
+            100 *
+            min(1, inliers / 20) *
+            min(1, inlier_ratio / 0.70) *
+            min(1, coverage / 0.15)
+        )
+
+        # Never present an uncertain match as 100%
+        score = min(95, score)
+
+        if (
+            inliers >= 12 and
+            inlier_ratio >= 0.50 and
+            coverage >= 0.08 and
+            geometry_valid
+        ):
+            status = "Likely match"
+            note = "Strong visual feature and geometric agreement found. Human verification is still required."
+
+        elif (
+            inliers >= 7 and
+            inlier_ratio >= 0.35 and
+            coverage >= 0.03 and
+            geometry_valid
+        ):
+            status = "Possible match"
+            note = "Some logo similarities were found, but the match is uncertain. Manager review is required."
+
+        else:
+            status = "Not detected"
+            note = "The official logo could not be reliably matched. Check whether the correct logo is present."
+
+        return {
+            "status": status,
+            "score": score,
+            "matched_features": inliers,
+            "note": note,
+            "method": "ORB with RANSAC geometric verification"
+        }
+
+    except Exception as exc:
+        return {
+            "status": "Unable to compare",
+            "score": 0,
+            "matched_features": 0,
+            "note": f"Logo comparison failed: {str(exc)[:180]}"
+        }
 
 
 def _brand_ocr_normalise(value: str) -> str:
