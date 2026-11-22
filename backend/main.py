@@ -1,3 +1,5 @@
+from google import genai
+from google.genai import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -596,15 +598,38 @@ def register_user(request: RegisterRequest):
         con.close()
 
 
+
 @app.post("/auth/login")
 def login_user(request: LoginRequest):
     con = get_connection()
-    user = execute_query(con,"SELECT * FROM users WHERE email=?",(email.strip().lower(),)).fetchone()
-    con.close()
-    if not user or not verify_password(request.password, user["password_hash"]):
+
+    try:
+        user = execute_query(
+            con,
+            "SELECT * FROM users WHERE email=?",
+            (request.email.strip().lower(),)
+        ).fetchone()
+    finally:
+        con.close()
+
+    if not user or not verify_password(
+        request.password,
+        user["password_hash"]
+    ):
         raise HTTPException(401, "Email or password is incorrect.")
-    safe_user = {"id": user["id"], "name": user["name"], "email": user["email"], "role": user["role"]}
-    return {"token": issue_token(safe_user), "user": safe_user}
+
+    safe_user = {
+        "id": user["id"],
+        "name": user["name"],
+        "email": user["email"],
+        "role": user["role"]
+    }
+
+    return {
+        "token": issue_token(safe_user),
+        "user": safe_user
+    }
+
 
 @app.get("/auth/me")
 def who_am_i(user=Depends(current_user)):
@@ -1661,6 +1686,52 @@ Return no more than 8 issues.
             })
 
         return valid_issues
+    except Exception as error:
+        print("Gemini analysis unavailable:", error)
+        return []
+def extract_text_with_gemini(image_bytes, mime_type):
+    """Extract visible poster text using Gemini image understanding."""
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+
+    if not api_key:
+        print("Gemini OCR unavailable: API key missing.")
+        return ""
+
+    try:
+        client = genai.Client(api_key=api_key)
+
+        prompt = """
+        Read all visible text in this poster or image.
+
+        Instructions:
+        - Extract the actual visible words.
+        - Preserve the original spelling.
+        - Include headings, small text and contact details.
+        - Keep the reading order as naturally as possible.
+        - Do not summarize or analyze the image.
+        - Return only the extracted text.
+        - If no text is visible, return an empty response.
+        """
+
+        response = client.models.generate_content(
+            model=model,
+            contents=[
+                prompt,
+                types.Part.from_bytes(
+                    data=image_bytes,
+                    mime_type=mime_type
+                )
+            ]
+        )
+
+        return (response.text or "").strip()
+
+    except Exception as error:
+        print("Gemini OCR error:", error)
+        return ""
+
 
     except Exception as error:
         print("Gemini analysis unavailable:", error)
@@ -2087,9 +2158,27 @@ async def analyze_image(file: UploadFile = File(...), user=Depends(current_user)
         image = Image.open(io.BytesIO(data)).convert("RGB")
         image_array = np.array(image)
 
-        # Step 1: Extract text using OCR
+        # Step 1: Extract text using Tesseract OCR
         results = run_improved_ocr(image)
         extracted = " ".join(item[1] for item in results)
+
+        # Step 1B: Use Gemini if Tesseract cannot extract text
+        if not extracted.strip():
+            print("Tesseract found no text. Trying Gemini image OCR...")
+            extracted = extract_text_with_gemini(data, file.content_type)
+
+            if extracted:
+                print("Gemini successfully extracted poster text.")
+            else:
+                print("Gemini could not extract poster text.")
+
+        # Identify the OCR method
+        if extracted and not results:
+            ocr_method = "Gemini image OCR fallback"
+        elif results:
+            ocr_method = "Original + enhanced Tesseract OCR with duplicate merging"
+        else:
+            ocr_method = "No text detected"
 
         # Step 2: Existing rule-based analysis
         issues = check_brand_compliance(extracted)
@@ -2114,39 +2203,42 @@ async def analyze_image(file: UploadFile = File(...), user=Depends(current_user)
                     issues.append(issue)
                     existing_messages.add(message)
 
-        # Step 4: Check poster readability
+        # Step 4: Check poster readability and brand colours
         readability = assess_poster_readability(image_array, results)
         guidelines = read_brand_guidelines()
+
         color_analysis = analyze_brand_colors(
-        image_array,
-        guidelines["approved_colors"]
-)
+            image_array,
+            guidelines["approved_colors"]
+        )
 
         readability["color_analysis"] = color_analysis
 
-           # Add warning when brand colours do not match
+        # Add warning when brand colours do not match
         if color_analysis["status"] == "Possible colour mismatch":
-           issues.append({
-        "word": "Brand colours",
-        "rule": "Visual identity / brand colour consistency",
-        "severity": "medium",
-        "source": "Brand colour analysis",
-        "message": "Some dominant poster colours differ from the approved brand palette.",
-        "suggestion": "Review the poster colours and use the approved brand colours where appropriate."
-    })
-         # Step 5: Load active brand logo and guidelines
+            issues.append({
+                "word": "Brand colours",
+                "rule": "Visual identity / brand colour consistency",
+                "severity": "medium",
+                "source": "Brand colour analysis",
+                "message": "Some dominant poster colours differ from the approved brand palette.",
+                "suggestion": "Review the poster colours and use the approved brand colours where appropriate."
+            })
+
+        # Step 5: Load active brand logo and guidelines
         con = get_connection()
         try:
             selected = active_id(con)
+
             logo_row = execute_query(
                 con,
                 "SELECT brand_name, logo_data, logo_filename "
                 "FROM brand_guideline_versions WHERE id=?",
                 (selected,)
             ).fetchone() if selected is not None else None
+
         finally:
             con.close()
-
 
         # Step 6: Compare official logo
         logo_match = compare_poster_logo(
@@ -2236,7 +2328,7 @@ async def analyze_image(file: UploadFile = File(...), user=Depends(current_user)
             "total_issues": len(issues),
             "readability": readability,
             "color_analysis": color_analysis,
-            "ocr_method": "Original + enhanced image OCR with duplicate merging",
+            "ocr_method": ocr_method,
             "status": "Needs Review" if issues else "Passed Basic Checks",
             "issues": issues
         }
