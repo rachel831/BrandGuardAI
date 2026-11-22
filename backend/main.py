@@ -1,3 +1,4 @@
+from PIL import ImageColor
 from google import genai
 from google.genai import types
 from datetime import datetime, timedelta, timezone
@@ -1208,18 +1209,76 @@ def health():
 
 
 def analyze_brand_colors(image, approved_colors):
-    if not approved_colors:
+
+    # Convert user-entered colour formats into HEX
+    def normalize_color(value):
+        if not isinstance(value, str):
+            return None
+
+        color = value.strip().lower()
+
+        if not color:
+            return None
+
+        # Support common colour names
+        aliases = {
+            "navy blue": "navy",
+            "off white": "#FAF9F6",
+            "off-white": "#FAF9F6",
+            "grey": "gray"
+        }
+
+        color = aliases.get(color, color)
+
+        try:
+            # Support HEX, CSS colour names and RGB formats
+            if re.fullmatch(r"[0-9a-f]{6}", color):
+                color = "#" + color
+
+            rgb = ImageColor.getrgb(color)
+
+            return "#{:02X}{:02X}{:02X}".format(
+                rgb[0], rgb[1], rgb[2]
+            )
+
+        except (ValueError, TypeError):
+            return None
+
+    # Accept a list or a single colour string
+    if isinstance(approved_colors, str):
+        if not approved_colors.strip().lower().startswith("rgb"):
+            approved_colors = re.split(r"[,;]", approved_colors)
+        else:
+            approved_colors = [approved_colors]
+
+    approved = []
+    invalid_colors = []
+
+    for color in approved_colors or []:
+        normalized = normalize_color(color)
+
+        if normalized:
+            if normalized not in approved:
+                approved.append(normalized)
+        else:
+            invalid_colors.append(color)
+
+    # Stop safely if no valid colours are available
+    if not approved:
         return {
-            "status": "No brand colours configured",
+            "status": "No valid brand colours configured",
             "approved_colors": [],
             "detected_colors": [],
-            "message": "Please add approved brand colours to the guidelines."
+            "matches": [],
+            "matched_count": 0,
+            "total_detected": 0,
+            "invalid_colors": invalid_colors,
+            "message": "Please enter valid colour names or HEX values."
         }
 
     # Resize image for faster processing
     resized = cv2.resize(image, (150, 150))
 
-    # Convert RGB to a list of pixels
     pixels = resized.reshape((-1, 3)).astype(np.float32)
 
     # Detect dominant colours using K-means
@@ -1242,16 +1301,59 @@ def analyze_brand_colors(image, approved_colors):
 
     for center in centers:
         rgb = [int(value) for value in center]
+
         hex_color = "#{:02X}{:02X}{:02X}".format(*rgb)
+
         detected_colors.append(hex_color)
 
-    # Convert approved colours to uppercase
-    approved = [
-        color.strip().upper()
-        for color in approved_colors
-        if isinstance(color, str) and color.strip()
-    ]
+    # Compare detected and approved colours
+    def color_distance(color1, color2):
+        rgb1 = np.array([
+            int(color1[i:i+2], 16)
+            for i in (1, 3, 5)
+        ])
 
+        rgb2 = np.array([
+            int(color2[i:i+2], 16)
+            for i in (1, 3, 5)
+        ])
+
+        return float(np.linalg.norm(rgb1 - rgb2))
+
+    matches = []
+
+    for detected in detected_colors:
+        closest = min(
+            approved,
+            key=lambda color: color_distance(detected, color)
+        )
+
+        distance = color_distance(detected, closest)
+
+        matches.append({
+            "detected": detected,
+            "closest_approved": closest,
+            "distance": round(distance, 2),
+            "match": distance <= 60
+        })
+
+    matched_count = sum(item["match"] for item in matches)
+
+    status = (
+        "Good match"
+        if matched_count == len(matches)
+        else "Possible colour mismatch"
+    )
+
+    return {
+        "status": status,
+        "approved_colors": approved,
+        "detected_colors": detected_colors,
+        "matches": matches,
+        "matched_count": matched_count,
+        "total_detected": len(matches),
+        "invalid_colors": invalid_colors
+    }
     # Compare detected and approved colours
     def color_distance(color1, color2):
         rgb1 = np.array([
