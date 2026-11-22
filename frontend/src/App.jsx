@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   ShieldCheck, LayoutDashboard, FileSearch, BookOpen, History, Plus, Trash2,
   UploadCloud, ScanSearch, CheckCircle2, AlertTriangle, ThumbsUp, RotateCcw,
-  Ban, RefreshCw, Power, FileText, LogOut, UserPlus, LockKeyhole
+  Ban, RefreshCw, Power, FileText, LogOut, UserPlus, LockKeyhole, Sparkles
 } from "lucide-react";
 
 const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
@@ -66,6 +66,8 @@ export default function App() {
   async function acceptSession(data) {
     localStorage.setItem(TOKEN_KEY,data.token);
     setToken(data.token); setUser(data.user); setPage("Dashboard");
+
+
     setError(""); setMessage(`Welcome, ${data.user.name}.`);
     setText(""); setTextReport(null); setImage(null); setImageReport(null);
     await loadHistory();
@@ -135,12 +137,25 @@ export default function App() {
     return () => { cancelled = true; };
   }, []);
 
-  async function loadHistory() {
-    setHistoryBusy(true);
-    try { const data=await request("/reviews"); setHistory(arr(data.reviews)); await loadAnalytics(); }
-    catch(e) { setError(e.message); }
-    finally { setHistoryBusy(false); }
+
+async function loadHistory() {
+  setHistoryBusy(true);
+
+  try {
+    const data = await request("/reviews");
+
+    setHistory(
+      Array.isArray(data.reviews) ? data.reviews : []
+    );
+
+    await loadAnalytics();
+  } catch (e) {
+    setError(e.message);
+  } finally {
+    setHistoryBusy(false);
   }
+}
+
   async function loadGuidelines() {
     setGuidelineBusy(true);
     try {
@@ -256,10 +271,125 @@ export default function App() {
     const v=value||"Pending Review";const cls=v==="Approved"?"approved":v==="Rejected"?"rejected":v==="Revision Requested"?"revision":"pending";
     return <span className={`pill ${cls}`}>{v}</span>;
   }
-  function issueTable(issues=[]) {
-    if(!issues.length)return <div className="empty-success"><CheckCircle2/><div><b>No issues detected by the current rules.</b><span>Human review is still recommended before publication.</span></div></div>;
-    return <div className="table-wrap"><table><thead><tr><th>Detected content</th><th>Brand rule</th><th>Severity</th><th>Explanation</th><th>Suggested correction</th></tr></thead><tbody>{issues.map((x,i)=><tr key={i}><td><b>{x.word||x.detected_text||"Issue"}</b></td><td>{x.rule||"Brand guideline"}</td><td><span className={`pill ${x.severity==="high"?"rejected":x.severity==="low"?"approved":"pending"}`}>{x.severity||"medium"}</span></td><td>{x.message||"This may not follow the active brand guidelines."}</td><td>{x.suggestion||"Replace with approved wording."}</td></tr>)}</tbody></table></div>;
+function issueTable(issues = []) {
+  if (!issues.length) {
+    return (
+      <div className="empty-success">
+        <CheckCircle2 />
+        <div>
+          <b>No issues detected by the current rules.</b>
+          <span>Human review is still recommended before publication.</span>
+        </div>
+      </div>
+    );
   }
+
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Detected content</th>
+            <th>Brand rule</th>
+            <th>Source</th>
+            <th>Severity</th>
+            <th>Explanation</th>
+            <th>Suggested correction</th>
+          </tr>
+        </thead>
+        <tbody>
+          {issues.map((x, i) => (
+            <tr key={i}>
+              <td><b>{x.word || x.detected_text || "Issue"}</b></td>
+              <td>{x.rule || "Brand guideline"}</td>
+              <td>
+                <span className={`ai-source-tag ${
+                  x.source === "Gemini AI" ? "gemini-tag" :
+                  x.source === "Rule-based" ? "rule-tag" : "unknown-tag"
+                }`}>
+                  {x.source || "Not classified"}
+                </span>
+              </td>
+              <td>
+                <span className={`pill ${
+                  x.severity?.toLowerCase() === "high" ? "rejected" :
+                  x.severity?.toLowerCase() === "low" ? "approved" : "pending"
+                }`}>
+                  {x.severity || "medium"}
+                </span>
+              </td>
+              <td>{x.message || "This may not follow the active brand guidelines."}</td>
+              <td>{x.suggestion || "Replace with approved wording."}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+function aiSummary(issues = []) {
+  const aiCount = issues.filter(
+    x => x.source === "Gemini AI"
+  ).length;
+
+  const ruleCount = issues.filter(
+    x => x.source === "Rule-based"
+  ).length;
+
+  const otherCount = issues.filter(
+    x => !x.source
+  ).length;
+
+  return (
+    <div className="ai-insight-card">
+      <div className="ai-circle-section">
+        <div className="ai-circle">
+          <div className="ai-circle-inner">
+            <Sparkles size={23} />
+            <strong>GEMINI AI</strong>
+            <span>{aiCount}</span>
+            <small>Findings</small>
+          </div>
+        </div>
+
+        <div className="ai-circle-label">
+          <h3>AI Content Intelligence</h3>
+          <p>Gemini AI findings in this report</p>
+          <span className="ai-status">
+            <span className="status-dot"></span>
+            AI analysis results
+          </span>
+        </div>
+      </div>
+
+      <div className="ai-summary-details">
+        <div className="ai-summary-item">
+          <span className="ai-dot gemini-dot"></span>
+          <div>
+            <strong>{aiCount}</strong>
+            <small>Gemini AI findings</small>
+          </div>
+        </div>
+
+        <div className="ai-summary-item">
+          <span className="ai-dot rule-dot"></span>
+          <div>
+            <strong>{ruleCount}</strong>
+            <small>Rule-based findings</small>
+          </div>
+        </div>
+
+        <div className="ai-summary-item">
+          <span className="ai-dot other-dot"></span>
+          <div>
+            <strong>{otherCount}</strong>
+            <small>Unclassified findings</small>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
   function readabilityPanel(report) {
     if(!report)return <div className="empty">No readability data available for this saved analysis.</div>;
     return <div className="readability-grid">
@@ -325,6 +455,169 @@ export default function App() {
   const pendingCount=history.filter(r=>!r.decision||r.decision==="Pending Human Review").length;
   const totalIssues=history.reduce((n,r)=>n+Number(r.total_issues||0),0);
 
+  function renderDashboard() {
+    const d = analytics?.decisions || {};
+    const approved = d.Approved || 0;
+    const rejected = d.Rejected || 0;
+    const revision = d["Revision Requested"] || 0;
+    const pending = d.Pending ?? pendingCount;
+    const total = analytics?.total_reviews ?? history.length;
+    const issues = analytics?.total_issues ?? totalIssues;
+    const decided = approved + rejected + revision;
+    const approvalRate = decided ? Math.round((approved / decided) * 100) : 0;
+    const avgIssues = total ? (issues / total).toFixed(1) : "0.0";
+    const sev = analytics?.severity || {};
+    const types = analytics?.content_types || {};
+    const daily = arr(analytics?.daily_reviews).slice(-7);
+    const dailyMax = Math.max(1, ...daily.map(x => Number(x.count) || 0));
+    const hour = new Date().getHours();
+    const greeting = hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
+    const today = new Date().toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+
+    const segments = [
+      ["Approved", approved, "#16a34a"],
+      ["Revision requested", revision, "#f59e0b"],
+      ["Rejected", rejected, "#dc2626"],
+      ["Pending", pending, "#94a3b8"],
+    ];
+    const segTotal = segments.reduce((n, s) => n + s[1], 0);
+    let acc = 0;
+    const donut = segTotal
+      ? `conic-gradient(${segments.map(([, v, c]) => {
+          const start = (acc / segTotal) * 100;
+          acc += v;
+          return `${c} ${start}% ${(acc / segTotal) * 100}%`;
+        }).join(",")})`
+      : "conic-gradient(#e2e8f0 0 100%)";
+
+    const kpis = [
+      { label: "Total submissions", value: total, hint: `${types.Text || 0} text · ${types.Image || 0} image`, icon: FileText, tone: "navy" },
+      { label: "Issues detected", value: issues, hint: `${avgIssues} per submission`, icon: AlertTriangle, tone: "amber" },
+      { label: "Awaiting review", value: pending, hint: pending ? "Needs a decision" : "Queue is clear", icon: History, tone: "slate" },
+      { label: "Approved", value: approved, hint: `${approvalRate}% approval rate`, icon: CheckCircle2, tone: "green" },
+      { label: "Revision requested", value: revision, hint: "Sent back to creators", icon: RotateCcw, tone: "orange" },
+      { label: "Rejected", value: rejected, hint: "Blocked from publishing", icon: Ban, tone: "red" },
+    ];
+
+    const severityRows = [["high", "High", "#dc2626"], ["medium", "Medium", "#f59e0b"], ["low", "Low", "#16a34a"]];
+    const severityTotal = Math.max(1, severityRows.reduce((n, [k]) => n + (sev[k] || 0), 0));
+    const typeTotal = Math.max(1, (types.Text || 0) + (types.Image || 0));
+
+    return <div className="dx">
+      <section className="dx-hero">
+        <div className="dx-hero-copy">
+          <span className="dx-date">{today}</span>
+          <h2>{greeting}, {user.name.split(" ")[0]}.</h2>
+          <p>{isManager
+            ? `${pending} submission${pending === 1 ? "" : "s"} waiting for your decision. Review flagged content before it goes live.`
+            : "Check your posts, ads and posters against the active brand guidelines before you publish."}</p>
+          <div className="dx-hero-actions">
+            <button className="btn hero-btn" onClick={() => setPage("Content Review")}><ScanSearch size={16} />Review new content</button>
+            <button className="btn dx-ghost" onClick={() => setPage("Review History")}><History size={16} />Open review history</button>
+          </div>
+        </div>
+        <div className="dx-hero-score">
+          <div className="dx-ring" style={{ "--p": approvalRate }}>
+            <div><strong>{approvalRate}%</strong><small>approval rate</small></div>
+          </div>
+          <span>{decided} reviewed decision{decided === 1 ? "" : "s"}</span>
+        </div>
+      </section>
+
+      <section className="dx-kpis">
+        {kpis.map(k => {
+          const Icon = k.icon;
+          return <article key={k.label} className={`dx-kpi ${k.tone}`}>
+            <div className="dx-kpi-icon"><Icon size={20} /></div>
+            <div className="dx-kpi-body">
+              <span>{k.label}</span>
+              <strong>{k.value}</strong>
+              <small>{k.hint}</small>
+            </div>
+          </article>;
+        })}
+      </section>
+
+      <section className="dx-row">
+        <div className="dx-card dx-card-wide">
+          <div className="dx-card-head">
+            <div><h3>Review decisions</h3><p>{isManager ? "Team-wide outcomes" : "Outcomes for your submissions"}</p></div>
+            <button className="btn light" onClick={loadAnalytics}><RefreshCw size={14} />{analyticsBusy ? "Updating..." : "Refresh"}</button>
+          </div>
+          <div className="dx-donut-wrap">
+            <div className="dx-donut" style={{ background: donut }}>
+              <div><strong>{total}</strong><small>total</small></div>
+            </div>
+            <ul className="dx-legend">
+              {segments.map(([name, value, color]) => <li key={name}>
+                <i style={{ background: color }} />
+                <span>{name}</span>
+                <b>{value}</b>
+                <em>{segTotal ? Math.round((value / segTotal) * 100) : 0}%</em>
+              </li>)}
+            </ul>
+          </div>
+        </div>
+
+        <div className="dx-card">
+          <div className="dx-card-head"><div><h3>Issue severity</h3><p>{issues} issue{issues === 1 ? "" : "s"} found overall</p></div></div>
+          <div className="dx-stack">
+            {severityRows.map(([k, , c]) => <span key={k} style={{ width: `${((sev[k] || 0) / severityTotal) * 100}%`, background: c }} />)}
+          </div>
+          {severityRows.map(([k, label, c]) => <div className="dx-meter" key={k}>
+            <span><i style={{ background: c }} />{label}</span>
+            <div className="dx-track"><b style={{ width: `${((sev[k] || 0) / severityTotal) * 100}%`, background: c }} /></div>
+            <em>{sev[k] || 0}</em>
+          </div>)}
+          <h4 className="dx-sub">Content type</h4>
+          {[["Text", "Text posts"], ["Image", "Posters / flyers"]].map(([k, label]) => <div className="dx-meter" key={k}>
+            <span>{label}</span>
+            <div className="dx-track"><b style={{ width: `${((types[k] || 0) / typeTotal) * 100}%` }} /></div>
+            <em>{types[k] || 0}</em>
+          </div>)}
+        </div>
+      </section>
+
+      <section className="dx-row">
+        <div className="dx-card dx-card-wide">
+          <div className="dx-card-head"><div><h3>Recent activity</h3><p>Submissions per day, last 7 active days</p></div></div>
+          {daily.length ? <div className="dx-bars">
+            {daily.map(x => <div className="dx-bar" key={x.date}>
+              <em>{x.count}</em>
+              <span style={{ height: `${Math.max(8, ((Number(x.count) || 0) / dailyMax) * 100)}%` }} />
+              <small>{String(x.date).slice(5)}</small>
+            </div>)}
+          </div> : <div className="dx-empty"><FileText size={28} /><b>No activity yet</b><span>Submit your first piece of content to see trends here.</span></div>}
+        </div>
+
+        <div className="dx-card">
+          <div className="dx-card-head"><div><h3>Quick actions</h3><p>Jump to common tasks</p></div></div>
+          <div className="dx-actions">
+            <button onClick={() => setPage("Content Review")}><span><ScanSearch size={18} /></span><div><b>Analyse content</b><small>Text, posters and flyers</small></div></button>
+            <button onClick={() => setPage("Review History")}><span><History size={18} /></span><div><b>Review history</b><small>Past reports and decisions</small></div></button>
+            {isManager && <button onClick={() => setPage("Brand Guidelines")}><span><BookOpen size={18} /></span><div><b>Brand guidelines</b><small>Edit approved rules</small></div></button>}
+          </div>
+        </div>
+      </section>
+
+      <section className="dx-card">
+        <div className="dx-card-head">
+          <div><h3>Recent reviews</h3><p>Your latest saved submissions</p></div>
+          <button className="btn light" onClick={() => setPage("Review History")}>View all</button>
+        </div>
+        {history.slice(0, 5).length ? <div className="table-wrap dx-table"><table className="history-table"><thead><tr><th>ID</th><th>Type</th><th>Submitted content</th><th>Issues</th><th>Final decision</th></tr></thead>
+          <tbody>{history.slice(0, 5).map(r => <tr key={r.id}>
+            <td><b>#{r.id}</b></td>
+            <td><span className="dx-type">{r.type === "Image" ? "Image" : "Text"}</span></td>
+            <td className="dx-content">{r.type === "Image" ? r.image_filename : (r.submitted_content || "").slice(0, 100)}</td>
+            <td><span className={`dx-issues ${Number(r.total_issues) ? "has" : "none"}`}>{r.total_issues}</span></td>
+            <td>{statusPill(r.decision)}</td>
+          </tr>)}</tbody></table></div>
+          : <div className="dx-empty"><ShieldCheck size={28} /><b>No reviews saved yet</b><span>Analyse your first piece of content to start building a review trail.</span></div>}
+      </section>
+    </div>;
+  }
+
   return <div className="app-shell"><style>{styles}</style>
     <aside className="sidebar"><div className="brand"><span className="brand-mark"><ShieldCheck size={23}/></span>BrandGuard AI</div><div className="nav-label">WORKSPACE</div>
       <nav className="nav">{nav.map(([name,Icon])=><button key={name} className={page===name?"active":""} onClick={()=>{setPage(name);setMessage("");setError("");}}><Icon size={18}/>{name}</button>)}</nav>
@@ -335,28 +628,7 @@ export default function App() {
         <div className="top-actions"><span className="role-label">{isManager?"Brand Manager / Reviewer":"Content Creator"} · {user.name}</span>{page==="Content Review"&&<button className="btn light" onClick={newAnalysis}><Plus size={16}/>New Analysis</button>}<button className="btn light" onClick={()=>logout()}><LogOut size={15}/>Log out</button></div>
       </header>
       {message&&<div className="notice ok">{message}</div>}{error&&<div className="notice err">{error}</div>}
-      {page==="Dashboard"&&<>
-        <section className="hero"><h2>Protect your brand before you publish.</h2><p>Submit social posts, advertisements, emails, posters and flyers. BrandGuard AI checks content against active brand guidelines and supports human review.</p><button className="btn hero-btn" onClick={()=>setPage("Content Review")}><ScanSearch size={16}/>Start a content review</button></section>
-        <div className="grid analytics-grid">
-          <div className="stat"><div className="stat-icon"><FileText/></div><div><strong>{analytics?.total_reviews ?? history.length}</strong><span>Total submissions</span></div></div>
-          <div className="stat"><div className="stat-icon"><AlertTriangle/></div><div><strong>{analytics?.total_issues ?? totalIssues}</strong><span>Issues detected</span></div></div>
-          <div className="stat"><div className="stat-icon"><History/></div><div><strong>{analytics?.decisions?.Pending ?? pendingCount}</strong><span>Pending reviews</span></div></div>
-          <div className="stat"><div className="stat-icon"><CheckCircle2/></div><div><strong>{analytics?.decisions?.Approved ?? 0}</strong><span>Approved</span></div></div>
-          <div className="stat"><div className="stat-icon"><Ban/></div><div><strong>{analytics?.decisions?.Rejected ?? 0}</strong><span>Rejected</span></div></div>
-          <div className="stat"><div className="stat-icon"><RotateCcw/></div><div><strong>{analytics?.decisions?.["Revision Requested"] ?? 0}</strong><span>Revision requested</span></div></div>
-        </div>
-        <section className="panel analytics-panel"><div className="panel-head"><div><h2>Submission analytics</h2><p>{isManager?"Team-wide review activity.":"Your submission activity."} Counts update when history is refreshed.</p></div><button className="btn light" onClick={loadAnalytics}><RefreshCw size={15}/>{analyticsBusy?"Updating...":"Refresh analytics"}</button></div>
-          <div className="analytics-columns">
-            <div><h3>Decision breakdown</h3>{["Pending","Approved","Revision Requested","Rejected"].map(k=>{const n=analytics?.decisions?.[k]||0;const max=Math.max(1,...Object.values(analytics?.decisions||{}));return <div className="metric-row" key={k}><span>{k}</span><div className="metric-track"><i style={{width:`${n/max*100}%`}}/></div><b>{n}</b></div>;})}</div>
-            <div><h3>Content type</h3>{["Text","Image"].map(k=>{const n=analytics?.content_types?.[k]||0;const max=Math.max(1,...Object.values(analytics?.content_types||{}));return <div className="metric-row" key={k}><span>{k==="Image"?"Posters / flyers":"Text"}</span><div className="metric-track"><i style={{width:`${n/max*100}%`}}/></div><b>{n}</b></div>;})}
-              <h3 style={{marginTop:18}}>Issue severity</h3>{["high","medium","low"].map(k=><div className="metric-row" key={k}><span>{k[0].toUpperCase()+k.slice(1)}</span><div className="metric-track"><i style={{width:`${(analytics?.severity?.[k]||0)/Math.max(1,analytics?.total_issues||0)*100}%`}}/></div><b>{analytics?.severity?.[k]||0}</b></div>)}</div>
-          </div>
-          <p className="muted">{analytics?.daily_reviews?.length?`Recent activity: ${analytics.daily_reviews.map(x=>`${x.date}: ${x.count}`).join(" · ")}`:"No submission activity yet."}</p>
-        </section>
-        <section className="panel"><div className="panel-head"><div><h2>Recent reviews</h2><p>Latest saved submissions</p></div><button className="btn light" onClick={()=>setPage("Review History")}>View history</button></div>
-          {history.slice(0,5).length?<div className="table-wrap"><table className="history-table"><thead><tr><th>ID</th><th>Type</th><th>Submitted content</th><th>Issues</th><th>Final decision</th></tr></thead><tbody>{history.slice(0,5).map(r=><tr key={r.id}><td>#{r.id}</td><td>{r.type}</td><td>{r.type==="Image"?r.image_filename:(r.submitted_content||"").slice(0,100)}</td><td>{r.total_issues}</td><td>{statusPill(r.decision)}</td></tr>)}</tbody></table></div>:<div className="empty">No reviews saved yet. Start by analysing content.</div>}
-        </section>
-      </>}
+      {page==="Dashboard"&&renderDashboard()}
       {page==="Content Review"&&<>
         <section className="panel"><div className="panel-head"><div><h2>Submit content for review</h2><p>Choose text or upload a poster, flyer or screenshot. Each new submission starts a fresh report.</p></div><ScanSearch color="#0f766e" size={25}/></div>
           <div className="split"><div><h3>1. Analyse typed content</h3><div className="field"><textarea placeholder="Paste a social media post, advertisement, email or other brand content..." value={text} onChange={e=>{if(textReport&&e.target.value!==text){setTextReport(null);setTextReviewId(null);setImage(null);setImageReport(null);setImageReviewId(null);if(fileRef.current)fileRef.current.value="";}setText(e.target.value);}}/></div><div className="inline"><span className="muted">{text.length} characters</span><button className="btn primary" disabled={busy} onClick={analyzeText}><ScanSearch size={16}/>{busy?"Analysing...":"Analyse text"}</button></div></div>
@@ -366,14 +638,219 @@ export default function App() {
         </section>
         {textReport&&<section className="panel"><div className="report-head"><div><h2>Text compliance report</h2><p>Automated analysis · Review ID #{textReviewId}</p></div><span className="pill pending">{textReport.total_issues?"Needs attention":"Basic checks passed"}</span></div>
           <div className="score-row"><div className="score">{textReport.score}<small>/100</small></div><div style={{flex:1}}><b>Basic compliance score</b><p className="muted">{textReport.total_issues} issue(s) detected</p><div className="bar"><span style={{width:`${textReport.score}%`}}/></div></div></div>
-          {issueTable(arr(textReport.issues))}{reviewerPanel(textReviewId,textDecision,setTextDecision,textNote,setTextNote)}</section>}
-        {imageReport&&<section className="panel"><div className="report-head"><div><h2>Image compliance report</h2><p>{imageReport.filename||image?.name} · OCR analysis · Review ID #{imageReviewId}</p></div><span className="pill pending">{imageReport.total_issues?"Needs attention":"Basic checks passed"}</span></div>
-          <h3>Text extracted from image (OCR)</h3><div className="ocr">{imageReport.extracted_text||"No text detected. Try a clearer, higher-resolution image."}</div>
-          <h3>Official logo check</h3>{logoMatchPanel(imageReport.readability?.logo_match)}
-          <h3>Poster / flyer readability analysis</h3><p className="muted">OCR method: {imageReport.ocr_method||"Enhanced OCR"}</p>{readabilityPanel(imageReport.readability)}
-          <h3>Detected brand issues</h3>{issueTable(arr(imageReport.issues))}
-          {reviewerPanel(imageReviewId,imageDecision,setImageDecision,imageNote,setImageNote)}<p className="muted" style={{marginTop:12}}>Readability results are automated estimates. Please verify the original image, especially small text, contrast and OCR accuracy.</p></section>}
-      </>}
+          {aiSummary(arr(textReport.issues))}
+{issueTable(arr(textReport.issues))}{reviewerPanel(textReviewId,textDecision,setTextDecision,textNote,setTextNote)}</section>}
+{imageReport && (() => {
+  const reportIssues = arr(imageReport.issues);
+  const highIssues = reportIssues.filter(
+    issue => String(issue.severity).toLowerCase() === "high"
+  ).length;
+
+  const colorData =
+    imageReport.color_analysis ||
+    imageReport.readability?.color_analysis;
+
+  const readability = imageReport.readability || {};
+
+  return (
+    <section className="panel image-report">
+
+      {/* 1. Report heading */}
+      <div className="image-report-header">
+        <div>
+          <span className="image-report-eyebrow">BRAND GOVERNANCE REPORT</span>
+          <h2>Image Analysis Report</h2>
+          <p>
+            {imageReport.filename || image?.name}
+            {" · "}Review ID #{imageReviewId}
+          </p>
+        </div>
+
+        <span className={`pill ${imageReport.total_issues ? "pending" : ""}`}>
+          {imageReport.total_issues
+            ? "Needs Review"
+            : "Basic Checks Passed"}
+        </span>
+      </div>
+
+      {/* 2. Summary metrics */}
+      <div className="image-metrics">
+        <div className="image-metric">
+          <strong>{imageReport.total_issues || 0}</strong>
+          <span>Total findings</span>
+        </div>
+
+        <div className="image-metric">
+          <strong>{highIssues}</strong>
+          <span>High severity</span>
+        </div>
+
+        <div className="image-metric">
+          <strong>
+            {readability.ocr_confidence !== undefined
+              ? `${(Number(readability.ocr_confidence) <= 1
+                  ? Number(readability.ocr_confidence) * 100
+                  : Number(readability.ocr_confidence)).toFixed(1)}%`
+              : "N/A"}
+          </strong>
+          <span>OCR confidence</span>
+        </div>
+
+        <div className="image-metric">
+          <strong>{readability.text_blocks ?? "N/A"}</strong>
+          <span>Text blocks</span>
+        </div>
+      </div>
+
+      {/* 3. Extracted text */}
+      <div className="image-report-section">
+        <h3>Extracted Text (OCR)</h3>
+        <p className="muted">
+          Text automatically detected from your uploaded poster.
+        </p>
+
+        <details className="ocr-details">
+          <summary>View extracted poster text</summary>
+          <div className="ocr">
+            {imageReport.extracted_text ||
+              "No text detected. Try a clearer, higher-resolution image."}
+          </div>
+        </details>
+      </div>
+
+      {/* 4. Visual identity */}
+      <div className="image-report-section">
+        <h3>Visual Identity Verification</h3>
+        {logoMatchPanel(readability.logo_match)}
+      </div>
+
+      {/* 5. Brand colour analysis */}
+      <div className="image-report-section">
+        <h3>Brand Colour Analysis</h3>
+
+        {!colorData ? (
+          <p className="muted">
+            Colour analysis results are not available for this report.
+          </p>
+        ) : (
+          <>
+            <div className="color-analysis-status">
+              <strong>{colorData.status}</strong>
+              <span>
+                {colorData.matched_count ?? 0} of{" "}
+                {colorData.total_detected ?? 0} detected colours matched.
+              </span>
+            </div>
+
+            <div className="color-comparison-grid">
+
+              <div className="color-group">
+                <h4>Approved Brand Colours</h4>
+                <div className="color-swatches">
+                  {arr(colorData.approved_colors).map((color, index) => (
+                    <div className="color-swatch-item" key={`approved-${index}`}>
+                      <span
+                        className="color-swatch"
+                        style={{ backgroundColor: color }}
+                      />
+                      <span>{color}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="color-group">
+                <h4>Detected Poster Colours</h4>
+                <div className="color-swatches">
+                  {arr(colorData.detected_colors).map((color, index) => (
+                    <div className="color-swatch-item" key={`detected-${index}`}>
+                      <span
+                        className="color-swatch"
+                        style={{ backgroundColor: color }}
+                      />
+                      <span>{color}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {arr(colorData.matches).length > 0 && (
+              <div className="color-match-list">
+                <h4>Colour Comparison Details</h4>
+
+                {arr(colorData.matches).map((match, index) => (
+                  <div className="color-match-row" key={index}>
+                    <span
+                      className="color-swatch small"
+                      style={{ backgroundColor: match.detected }}
+                    />
+                    <span>{match.detected}</span>
+
+                    <span className="color-match-arrow">→</span>
+
+                    <span
+                      className="color-swatch small"
+                      style={{ backgroundColor: match.closest_approved }}
+                    />
+                    <span>{match.closest_approved}</span>
+
+                    <span className={`color-match-label ${match.match ? "matched" : "unmatched"}`}>
+                      {match.match ? "Matched" : "Review"}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* 6. Readability */}
+      <div className="image-report-section">
+        <h3>Poster Readability & Accessibility</h3>
+        <p className="muted">
+          OCR method: {imageReport.ocr_method || "Enhanced OCR"}
+        </p>
+        {readabilityPanel(readability)}
+      </div>
+
+      {/* 7. Compliance findings */}
+      <div className="image-report-section">
+        <h3>Brand Compliance Findings</h3>
+        <p className="muted">
+          Review detected issues, their sources, severity and suggested corrections.
+        </p>
+        {issueTable(reportIssues)}
+      </div>
+
+      {/* 8. Human decision */}
+      <div className="image-report-section human-review-section">
+        <h3>Human Review Decision</h3>
+        <p className="muted">
+          AI identifies possible issues. The human reviewer makes the final decision.
+        </p>
+
+        {reviewerPanel(
+          imageReviewId,
+          imageDecision,
+          setImageDecision,
+          imageNote,
+          setImageNote
+        )}
+      </div>
+
+      <p className="muted image-report-footer">
+        Automated results are estimates, not guarantees. Please verify the
+        original poster, especially small text, contrast, logo authenticity
+        and OCR accuracy.
+      </p>
+
+    </section>
+  );
+})()}
+</>}
+
       {page==="Brand Guidelines"&&isManager&&<>
         <section className="panel"><div className="panel-head"><div><h2>{isNewGuideline?"Add a new brand profile":"Active brand profile"}</h2><p>{isNewGuideline?"Saving creates a separate profile and activates it.":"These rules are used by the compliance checker."}</p></div><button className="btn primary" onClick={startNewGuideline}><Plus size={16}/>Add New Brand Guideline</button></div>
           {guidelineBusy?<div className="empty">Loading brand guidelines...</div>:<form onSubmit={saveGuideline}>
@@ -392,8 +869,12 @@ export default function App() {
         </section>
       </>}
       {page==="Review History"&&<section className="panel"><div className="panel-head"><div><h2>Saved content reviews</h2><p>{isManager?"All team submissions and final reviewer decisions.":"Your saved submissions and their review status."}</p></div><div className="inline"><button className="btn light" onClick={loadHistory}><RefreshCw size={15}/>Refresh</button>{isManager&&<button className="btn danger" onClick={clearHistory}><Trash2 size={15}/>Clear History</button>}</div></div>
-        {historyBusy?<div className="empty">Loading review history...</div>:history.length?<div className="table-wrap"><table className="history-table"><thead><tr><th>Review ID / Type</th><th>Submitted content</th><th>Date</th><th>Issues</th><th>Final decision</th><th>Actions</th></tr></thead><tbody>{history.map(r=><tr key={r.id}><td>#{r.id}<br/><span className="muted">{r.type}</span></td><td>{r.type==="Image"?(r.image_filename||"Uploaded image"):(r.submitted_content||"").slice(0,180)}</td><td>{dateText(r.date)}</td><td>{r.total_issues}</td><td>{statusPill(r.decision)}</td><td><div className="actions"><button className="btn light" onClick={()=>{setSelectedReviewId(selectedReviewId===r.id?null:r.id);setHistoryReviewerNote(r.reviewer_note||"");}}>{selectedReviewId===r.id?"Close":"Review details"}</button><button className="btn danger" onClick={()=>deleteReview(r.id)}><Trash2 size={14}/>Delete</button></div></td></tr>)}</tbody></table></div>:<div className="empty"><History size={30}/><p>No saved reviews yet.</p></div>}
+        {historyBusy?<div className="empty">Loading review history...</div>:history.length?<div className="table-wrap"><table className="history-table"><thead><tr><th>Review ID / Type</th><th>Submitted content</th><th>Date</th><th>Issues</th><th>Final decision</th><th>Actions</th></tr></thead><tbody>{history.map(r=><tr key={r.id}><td>#{r.id}<br/><span className="muted">{r.type}</span></td><td>{r.type==="Image"?(r.submitted_content||r.image_filename||"Uploaded image"):(r.submitted_content||"").slice(0,180)}</td><td>{dateText(r.date)}</td><td>{r.total_issues}</td><td>{statusPill(r.decision)}</td><td><div className="actions"><button className="btn light" onClick={()=>{setSelectedReviewId(selectedReviewId===r.id?null:r.id);setHistoryReviewerNote(r.reviewer_note||"");}}>{selectedReviewId===r.id?"Close":"Review details"}</button><button className="btn danger" onClick={()=>deleteReview(r.id)}><Trash2 size={14}/>Delete</button></div></td></tr>)}</tbody></table></div>:<div className="empty"><History size={30}/><p>No saved reviews yet.</p></div>}
+        <div className="empty">
+  Reviews loaded: {history.length}
+</div>
         {selectedReviewId && (()=>{const r=history.find(x=>x.id===selectedReviewId);if(!r)return null;return <section className="history-detail"><div className="panel-head"><div><h2>Review #{r.id} · {r.type}</h2><p>Submitted {dateText(r.date)} · {r.total_issues} detected issue(s)</p></div>{statusPill(r.decision)}</div>
+
           {r.type==="Image"&&<><h3>Official logo check</h3>{logoMatchPanel(r.readability?.logo_match)}<h3>Poster / flyer readability analysis</h3>{readabilityPanel(r.readability)}<h3>Extracted text (OCR)</h3><div className="ocr">{r.extracted_text||"No text was detected."}</div></>}
           {r.type!=="Image"&&<><h3>Submitted content</h3><div className="ocr">{r.submitted_content}</div></>}
           <h3>Detected brand issues</h3>{issueTable(arr(r.issues))}
@@ -404,7 +885,6 @@ export default function App() {
     </main>
   </div>;
 }
-
 const styles = `
 *{box-sizing:border-box}body{margin:0;background:#f3f6fb;font-family:Inter,Segoe UI,Arial,sans-serif;color:#172554}button,input,textarea{font:inherit}
 .app-shell{min-height:100vh;display:flex;background:#f3f6fb}.sidebar{width:245px;background:#142344;color:#fff;padding:26px 16px;display:flex;flex-direction:column;flex-shrink:0}
@@ -433,4 +913,489 @@ textarea,input{width:100%;border:1px solid #d8e0eb;border-radius:8px;padding:12p
 @media(max-width:600px){.readability-grid{grid-template-columns:1fr 1fr}.app-shell{display:block}.sidebar{width:100%;padding:14px}.brand{padding-bottom:12px}.nav{display:flex;overflow:auto}.nav-label,.sidebar-foot{display:none}.nav button{white-space:nowrap;width:auto}.main{padding:18px 12px}.grid{grid-template-columns:1fr}.topbar{align-items:flex-start;flex-direction:column}.demo-buttons{grid-template-columns:1fr}.auth-card{padding:24px}}
 
 .analytics-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.analytics-columns{display:grid;grid-template-columns:1fr 1fr;gap:28px}.metric-row{display:grid;grid-template-columns:130px 1fr 30px;align-items:center;gap:10px;margin:12px 0;font-size:13px}.metric-track{height:9px;background:#e8eef2;border-radius:99px;overflow:hidden}.metric-track i{display:block;height:100%;background:#0f766e;border-radius:99px}.logo-match-card{border:1px solid #dbe5ec;border-radius:12px;padding:16px;margin:10px 0 18px;background:#fbfdff}.logo-match-top{display:flex;align-items:center;justify-content:space-between;gap:12px}.logo-match-top p{margin:4px 0}.logo-match-score{display:flex;align-items:baseline;gap:10px;margin:12px 0}.logo-match-score strong{font-size:28px;color:#0f766e}.logo-match-score span{font-size:12px;color:#64748b}.logo-match-card>p{font-size:13px;line-height:1.5}.logo-upload-row{display:flex;align-items:center;gap:16px;flex-wrap:wrap}.brand-logo-preview{width:112px;height:88px;object-fit:contain;border:1px solid #dbe3e8;border-radius:12px;padding:8px;background:#fff}.brand-logo-placeholder{width:112px;height:88px;display:grid;place-items:center;text-align:center;padding:8px;border:1px dashed #aab8c2;border-radius:12px;color:#64748b;font-size:12px;overflow-wrap:anywhere}.logo-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.logo-actions small{flex-basis:100%}@media(max-width:760px){.analytics-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.analytics-columns{grid-template-columns:1fr}.metric-row{grid-template-columns:105px 1fr 24px}}
+/* GEMINI AI SUMMARY */
+
+.ai-insight-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 25px;
+  padding: 25px;
+  margin: 20px 0;
+  background: linear-gradient(120deg, #f0fdfa, #f8fafc);
+  border: 1px solid #ccfbf1;
+  border-radius: 16px;
+  flex-wrap: wrap;
+}
+
+.ai-circle-section {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+
+.ai-circle {
+  width: 120px;
+  height: 120px;
+  border-radius: 50%;
+  padding: 7px;
+  background: conic-gradient(
+    #0f766e,
+    #2dd4bf,
+    #99f6e4,
+    #0f766e
+  );
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.ai-circle-inner {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  background: white;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: #0f766e;
+  gap: 2px;
+}
+
+.ai-circle-inner strong {
+  font-size: 10px;
+  letter-spacing: 1px;
+}
+
+.ai-circle-inner span {
+  font-size: 25px;
+  font-weight: 800;
+}
+
+.ai-circle-inner small {
+  font-size: 10px;
+  color: #64748b;
+}
+
+.ai-circle-label h3 {
+  margin: 0 0 6px;
+  color: #172554;
+  font-size: 17px;
+}
+
+.ai-circle-label p {
+  margin: 0 0 9px;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.ai-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #0f766e;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #0f766e;
+}
+
+.ai-summary-details {
+  display: flex;
+  gap: 24px;
+  flex-wrap: wrap;
+}
+
+.ai-summary-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.ai-summary-item div {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ai-summary-item strong {
+  font-size: 21px;
+  color: #172554;
+}
+
+.ai-summary-item small {
+  font-size: 11px;
+  color: #64748b;
+}
+
+.ai-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+
+.gemini-dot {
+  background: #0f766e;
+}
+
+.rule-dot {
+  background: #3b82f6;
+}
+
+.other-dot {
+  background: #94a3b8;
+}
+
+.ai-source-tag {
+  display: inline-block;
+  padding: 5px 9px;
+  border-radius: 20px;
+  font-size: 10px;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.gemini-tag {
+  background: #ccfbf1;
+  color: #0f766e;
+}
+
+.rule-tag {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.unknown-tag {
+  background: #f1f5f9;
+  color: #475569;
+}
+
+@media (max-width: 650px) {
+  .ai-insight-card {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .ai-summary-details {
+    gap: 18px;
+  }
+}
+
+/* PROFESSIONAL DASHBOARD */
+.dx{display:grid;gap:18px}
+.dx-hero{display:flex;justify-content:space-between;align-items:center;gap:28px;padding:30px 34px;border-radius:16px;color:#fff;background:radial-gradient(900px 300px at 100% 0,#14b8a644,transparent 60%),linear-gradient(120deg,#142344,#172554 45%,#0f766e);box-shadow:0 10px 30px #14234433}
+.dx-date{font-size:12px;color:#a9c4d8}
+.dx-hero h2{font-size:26px;margin:6px 0 8px;letter-spacing:-.3px}
+.dx-hero p{color:#d3e4ee;max-width:560px;line-height:1.6;font-size:13.5px}
+.dx-hero-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:20px}
+.dx-ghost{background:#ffffff1a;color:#fff;border:1px solid #ffffff33}.dx-ghost:hover{background:#ffffff2b}
+.dx-hero-score{display:flex;flex-direction:column;align-items:center;gap:10px;font-size:12px;color:#c3d9e6;flex-shrink:0}
+.dx-ring{--p:0;width:132px;height:132px;border-radius:50%;display:grid;place-items:center;background:conic-gradient(#5eead4 calc(var(--p)*1%),#ffffff26 0)}
+.dx-ring>div{width:104px;height:104px;border-radius:50%;background:#142344;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.dx-ring strong{font-size:28px;line-height:1}.dx-ring small{font-size:11px;color:#a9c4d8;margin-top:4px}
+
+.dx-kpis{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+.dx-kpi{display:flex;gap:15px;align-items:center;background:#fff;border:1px solid #e5eaf1;border-radius:14px;padding:18px 20px;border-left:4px solid var(--c);box-shadow:0 2px 8px #17255408;transition:box-shadow .2s}
+.dx-kpi:hover{box-shadow:0 8px 22px #1725541a}
+.dx-kpi.navy{--c:#172554;--bg:#e8ecf8}.dx-kpi.amber{--c:#d97706;--bg:#fef3c7}.dx-kpi.slate{--c:#64748b;--bg:#eef2f6}
+.dx-kpi.green{--c:#16a34a;--bg:#dcfce7}.dx-kpi.orange{--c:#ea580c;--bg:#ffedd5}.dx-kpi.red{--c:#dc2626;--bg:#fee2e2}
+.dx-kpi-icon{width:44px;height:44px;border-radius:12px;display:grid;place-items:center;background:var(--bg);color:var(--c);flex-shrink:0}
+.dx-kpi-body{display:flex;flex-direction:column;gap:2px;min-width:0}
+.dx-kpi-body span{font-size:12px;color:#64748b;font-weight:600}
+.dx-kpi-body strong{font-size:26px;line-height:1.15;color:#172554}
+.dx-kpi-body small{font-size:11.5px;color:#94a3b8}
+
+.dx-row{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr);gap:18px}
+.dx-card{background:#fff;border:1px solid #e5eaf1;border-radius:14px;padding:22px;box-shadow:0 2px 8px #17255408;min-width:0}
+.dx-card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:18px}
+.dx-card-head h3{font-size:16px;margin:0 0 4px;color:#172554}.dx-card-head p{margin:0;font-size:12.5px;color:#64748b}
+.dx-sub{font-size:13px;margin:22px 0 4px;color:#334155}
+
+.dx-donut-wrap{display:flex;align-items:center;gap:34px;flex-wrap:wrap}
+.dx-donut{width:176px;height:176px;border-radius:50%;display:grid;place-items:center;flex-shrink:0}
+.dx-donut>div{width:122px;height:122px;border-radius:50%;background:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.dx-donut strong{font-size:30px;color:#172554;line-height:1}.dx-donut small{font-size:12px;color:#64748b;margin-top:4px}
+.dx-legend{list-style:none;margin:0;padding:0;flex:1;min-width:210px;display:grid;gap:4px}
+.dx-legend li{display:grid;grid-template-columns:12px 1fr auto 44px;gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid #eef2f6;font-size:13px;color:#334155}
+.dx-legend li:last-child{border-bottom:0}.dx-legend i{width:10px;height:10px;border-radius:3px}
+.dx-legend b{color:#172554}.dx-legend em{font-style:normal;color:#94a3b8;font-size:12px;text-align:right}
+
+.dx-stack{display:flex;height:12px;border-radius:99px;overflow:hidden;background:#e8eef2;margin-bottom:10px}
+.dx-meter{display:grid;grid-template-columns:120px 1fr 28px;align-items:center;gap:10px;margin:11px 0;font-size:13px;color:#334155}
+.dx-meter span{display:flex;align-items:center;gap:8px}.dx-meter span i{width:9px;height:9px;border-radius:3px}
+.dx-meter em{font-style:normal;font-weight:700;color:#172554;text-align:right}
+.dx-track{height:8px;border-radius:99px;background:#e8eef2;overflow:hidden}.dx-track b{display:block;height:100%;border-radius:99px;background:#0f766e}
+
+.dx-bars{display:flex;align-items:flex-end;gap:14px;height:190px;padding-top:6px}
+.dx-bar{flex:1;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:6px;min-width:0}
+.dx-bar span{width:100%;max-width:46px;border-radius:8px 8px 3px 3px;background:linear-gradient(180deg,#14b8a6,#0f766e)}
+.dx-bar em{font-style:normal;font-size:12px;font-weight:700;color:#172554}.dx-bar small{font-size:11px;color:#94a3b8}
+
+.dx-actions{display:grid;gap:10px}
+.dx-actions button{display:flex;align-items:center;gap:14px;text-align:left;border:1px solid #e5eaf1;background:#f8fafc;border-radius:12px;padding:13px 14px;cursor:pointer;color:#172554;transition:background .15s,border-color .15s}
+.dx-actions button:hover{background:#eefaf8;border-color:#99d8cf}
+.dx-actions span{width:38px;height:38px;border-radius:10px;background:#e2f5f1;color:#0f766e;display:grid;place-items:center;flex-shrink:0}
+.dx-actions b{display:block;font-size:13.5px}.dx-actions small{font-size:12px;color:#64748b}
+
+.dx-table{margin:0}.dx-content{max-width:420px;color:#475569}
+.dx-type{background:#eef2f6;color:#475569;border-radius:6px;padding:4px 8px;font-size:11px;font-weight:700}
+.dx-issues{display:inline-grid;place-items:center;min-width:26px;height:26px;border-radius:8px;font-weight:700;font-size:12px}
+.dx-issues.has{background:#fef3c7;color:#92400e}.dx-issues.none{background:#dcfce7;color:#166534}
+.dx-empty{display:flex;flex-direction:column;align-items:center;gap:6px;padding:34px 16px;text-align:center;color:#94a3b8}
+.dx-empty b{color:#334155;font-size:14px}.dx-empty span{font-size:12.5px;max-width:320px;line-height:1.5}
+
+@media(max-width:1000px){.dx-row{grid-template-columns:1fr}.dx-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:700px){.dx-hero{flex-direction:column;align-items:flex-start;padding:24px}.dx-hero-score{align-self:center}.dx-kpis{grid-template-columns:1fr}.dx-meter{grid-template-columns:96px 1fr 26px}}
+
+/* IMAGE REPORT REDESIGN */
+
+.image-report {
+  padding: 26px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.image-report-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.image-report-header h2 {
+  color: #142b4f;
+  font-size: 25px;
+  margin: 6px 0;
+}
+
+.image-report-header p {
+  color: #64748b;
+  margin: 0;
+}
+
+.image-report-eyebrow {
+  color: #0f8278;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 1.2px;
+}
+
+.image-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.image-metric {
+  background: #f5f8fc;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 20px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.image-metric strong {
+  color: #087f78;
+  font-size: 27px;
+}
+
+.image-metric span {
+  color: #64748b;
+  font-size: 13px;
+}
+
+.image-report-section {
+  padding: 22px;
+  border: 1px solid #e2e8f0;
+  border-radius: 13px;
+  background: #ffffff;
+  min-width: 0;
+}
+
+.image-report-section h3 {
+  color: #142b4f;
+  font-size: 17px;
+  margin: 0 0 10px;
+  text-align: left;
+}
+
+.image-report-section h4 {
+  color: #263b5c;
+  font-size: 14px;
+  margin: 0 0 12px;
+}
+
+.image-report-section > .muted {
+  margin: 0 0 16px;
+  color: #64748b;
+  font-size: 13px;
+}
+
+.ocr-details {
+  background: #f5f8fc;
+  border: 1px solid #e2e8f0;
+  border-radius: 9px;
+  padding: 14px;
+}
+
+.ocr-details summary {
+  cursor: pointer;
+  color: #087f78;
+  font-weight: 700;
+}
+
+.ocr-details .ocr {
+  margin-top: 14px;
+  text-align: left;
+  overflow-wrap: anywhere;
+  line-height: 1.8;
+}
+
+.color-analysis-status {
+  background: #eff8f6;
+  border: 1px solid #d2ebe5;
+  border-radius: 10px;
+  padding: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+
+.color-analysis-status strong {
+  color: #087f78;
+}
+
+.color-analysis-status span {
+  color: #52657b;
+  font-size: 13px;
+}
+
+.color-comparison-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.color-group {
+  background: #f7f9fc;
+  border: 1px solid #e2e8f0;
+  padding: 17px;
+  border-radius: 10px;
+  min-width: 0;
+}
+
+.color-swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+}
+
+.color-swatch-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: #52657b;
+}
+
+.color-swatch {
+  display: inline-block;
+  width: 45px;
+  height: 45px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  flex-shrink: 0;
+}
+
+.color-match-list {
+  margin-top: 20px;
+  border-top: 1px solid #e2e8f0;
+  padding-top: 18px;
+}
+
+.color-match-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 0;
+  border-bottom: 1px solid #edf0f5;
+  font-size: 13px;
+  color: #52657b;
+}
+
+.color-swatch.small {
+  width: 25px;
+  height: 25px;
+  border-radius: 5px;
+}
+
+.color-match-arrow {
+  color: #94a3b8;
+  font-weight: bold;
+}
+
+.color-match-label {
+  margin-left: auto;
+  padding: 5px 10px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.color-match-label.matched {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.color-match-label.unmatched {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.human-review-section {
+  background: #f8fafc;
+}
+
+.image-report-footer {
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.7;
+  margin: 0;
+  padding-top: 8px;
+}
+
+@media (max-width: 750px) {
+  .image-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .color-comparison-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .image-report {
+    padding: 14px;
+  }
+
+  .image-report-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
 `;

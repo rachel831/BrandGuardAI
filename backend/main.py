@@ -2,7 +2,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 import base64, hashlib, hmac, io, json, os, re, secrets, sqlite3
+import psycopg
+from psycopg.rows import dict_row
 from difflib import get_close_matches
+from dotenv import load_dotenv
+from google import genai
 
 import pytesseract
 from pytesseract import Output
@@ -26,12 +30,14 @@ from pydantic import BaseModel, Field
 
 
 BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
 # Use Render persistent storage when configured; otherwise use local database.
 DATA_DIR = Path(os.getenv("BRANDGUARD_DATA_DIR", str(BASE_DIR)))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_NAME = DATA_DIR / "brandguard.db"
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Use a secure environment variable in deployment.
 TOKEN_SECRET = os.getenv(
@@ -43,6 +49,12 @@ TOKEN_HOURS = 24 * 7
 
 
 def get_connection():
+    if DATABASE_URL:
+        return psycopg.connect(
+            DATABASE_URL,
+            row_factory=dict_row
+        )
+
     con = sqlite3.connect(DB_NAME)
     con.row_factory = sqlite3.Row
     return con
@@ -88,68 +100,362 @@ def read_token(token):
 
 def initialize_database():
     con = get_connection()
-    con.execute("""CREATE TABLE IF NOT EXISTS brand_guidelines (
-        id INTEGER PRIMARY KEY, brand_name TEXT NOT NULL, tone_of_voice TEXT NOT NULL,
-        approved_colors TEXT NOT NULL, restricted_terms TEXT NOT NULL, approved_claims TEXT NOT NULL)""")
-    con.execute("""CREATE TABLE IF NOT EXISTS brand_guideline_versions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, brand_name TEXT NOT NULL,
-        tone_of_voice TEXT NOT NULL DEFAULT '', approved_colors TEXT NOT NULL DEFAULT '[]',
-        restricted_terms TEXT NOT NULL DEFAULT '[]', approved_claims TEXT NOT NULL DEFAULT '[]',
-        approved_terms TEXT NOT NULL DEFAULT '[]', required_terms TEXT NOT NULL DEFAULT '[]',
-        brand_facts TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL)""")
-    guideline_columns = [r["name"] for r in con.execute("PRAGMA table_info(brand_guideline_versions)").fetchall()]
-    for column in ("approved_terms", "required_terms", "brand_facts"):
-        if column not in guideline_columns:
-            con.execute(f"ALTER TABLE brand_guideline_versions ADD COLUMN {column} TEXT NOT NULL DEFAULT '[]'")
-    # Optional brand logo storage; old guideline versions remain valid.
-    if "logo_data" not in guideline_columns:
-        con.execute("ALTER TABLE brand_guideline_versions ADD COLUMN logo_data BLOB")
-    if "logo_filename" not in guideline_columns:
-        con.execute("ALTER TABLE brand_guideline_versions ADD COLUMN logo_filename TEXT DEFAULT ''")
-    if "logo_mime_type" not in guideline_columns:
-        con.execute("ALTER TABLE brand_guideline_versions ADD COLUMN logo_mime_type TEXT DEFAULT ''")
-    con.execute("""CREATE TABLE IF NOT EXISTS app_settings (
-        setting_key TEXT PRIMARY KEY, setting_value TEXT NOT NULL)""")
-    con.execute("""CREATE TABLE IF NOT EXISTS content_reviews (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, content_type TEXT NOT NULL,
-        submitted_content TEXT, extracted_text TEXT, issues_json TEXT NOT NULL,
-        total_issues INTEGER NOT NULL, analysis_status TEXT NOT NULL,
-        decision TEXT NOT NULL DEFAULT 'Pending Human Review', reviewer_note TEXT DEFAULT '',
-        image_filename TEXT DEFAULT '', image_data BLOB, created_at TEXT NOT NULL)""")
-    con.execute("""CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
-        password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('creator','manager')),
-        created_at TEXT NOT NULL)""")
-    columns = [r["name"] for r in con.execute("PRAGMA table_info(content_reviews)").fetchall()]
-    if "user_id" not in columns:
-        con.execute("ALTER TABLE content_reviews ADD COLUMN user_id INTEGER")
-    if "readability_json" not in columns:
-        con.execute("ALTER TABLE content_reviews ADD COLUMN readability_json TEXT DEFAULT '{}'")
-    first = con.execute("SELECT id FROM brand_guideline_versions ORDER BY id LIMIT 1").fetchone()
-    if not first:
-        old = con.execute("SELECT * FROM brand_guidelines WHERE id=1").fetchone()
-        values = (old["brand_name"], old["tone_of_voice"], old["approved_colors"], old["restricted_terms"], old["approved_claims"]) if old else (
-            "My Brand", "Professional, friendly and trustworthy",
-            json.dumps(["#0F766E", "#172554", "#FFFFFF"]),
-            json.dumps(["guaranteed", "100% free", "best in the world"]),
-            json.dumps(["Quality products", "Customer satisfaction"]))
-        cur = con.execute("""INSERT INTO brand_guideline_versions
-            (brand_name,tone_of_voice,approved_colors,restricted_terms,approved_claims,created_at)
-            VALUES (?,?,?,?,?,?)""", (*values, datetime.now().astimezone().isoformat(timespec="seconds")))
-        con.execute("INSERT OR REPLACE INTO app_settings VALUES ('active_guideline_id',?)", (str(cur.lastrowid),))
-    elif not con.execute("SELECT 1 FROM app_settings WHERE setting_key='active_guideline_id'").fetchone():
-        con.execute("INSERT INTO app_settings VALUES ('active_guideline_id',?)", (str(first["id"]),))
-    demo_users = [
-        ("Judge Creator", "creator@brandguard.demo", "CreatorDemo123!", "creator"),
-        ("Judge Brand Manager", "manager@brandguard.demo", "ManagerDemo123!", "manager")
-    ]
-    for name, email, password, role in demo_users:
-        if not con.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone():
-            con.execute("INSERT INTO users(name,email,password_hash,role,created_at) VALUES(?,?,?,?,?)",
-                (name, email, hash_password(password), role, datetime.now().astimezone().isoformat(timespec="seconds")))
+
+    if DATABASE_URL:
+        # PostgreSQL tables
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS brand_guidelines (
+                id INTEGER PRIMARY KEY,
+                brand_name TEXT NOT NULL,
+                tone_of_voice TEXT NOT NULL,
+                approved_colors TEXT NOT NULL,
+                restricted_terms TEXT NOT NULL,
+                approved_claims TEXT NOT NULL
+            )
+        """)
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS brand_guideline_versions (
+                id BIGSERIAL PRIMARY KEY,
+                brand_name TEXT NOT NULL,
+                tone_of_voice TEXT NOT NULL DEFAULT '',
+                approved_colors TEXT NOT NULL DEFAULT '[]',
+                restricted_terms TEXT NOT NULL DEFAULT '[]',
+                approved_claims TEXT NOT NULL DEFAULT '[]',
+                approved_terms TEXT NOT NULL DEFAULT '[]',
+                required_terms TEXT NOT NULL DEFAULT '[]',
+                brand_facts TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                logo_data BYTEA,
+                logo_filename TEXT DEFAULT '',
+                logo_mime_type TEXT DEFAULT ''
+            )
+        """)
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS app_settings (
+                setting_key TEXT PRIMARY KEY,
+                setting_value TEXT NOT NULL
+            )
+        """)
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS content_reviews (
+                id BIGSERIAL PRIMARY KEY,
+                content_type TEXT NOT NULL,
+                submitted_content TEXT,
+                extracted_text TEXT,
+                issues_json TEXT NOT NULL,
+                total_issues INTEGER NOT NULL,
+                analysis_status TEXT NOT NULL,
+                decision TEXT NOT NULL DEFAULT 'Pending Human Review',
+                reviewer_note TEXT DEFAULT '',
+                image_filename TEXT DEFAULT '',
+                image_data BYTEA,
+                created_at TEXT NOT NULL,
+                user_id INTEGER,
+                readability_json TEXT DEFAULT '{}'
+            )
+        """)
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id BIGSERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('creator','manager')),
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        # Safely add columns if older PostgreSQL tables exist
+        con.execute("""
+            ALTER TABLE brand_guideline_versions
+            ADD COLUMN IF NOT EXISTS approved_terms TEXT NOT NULL DEFAULT '[]'
+        """)
+        con.execute("""
+            ALTER TABLE brand_guideline_versions
+            ADD COLUMN IF NOT EXISTS required_terms TEXT NOT NULL DEFAULT '[]'
+        """)
+        con.execute("""
+            ALTER TABLE brand_guideline_versions
+            ADD COLUMN IF NOT EXISTS brand_facts TEXT NOT NULL DEFAULT '[]'
+        """)
+        con.execute("""
+            ALTER TABLE brand_guideline_versions
+            ADD COLUMN IF NOT EXISTS logo_data BYTEA
+        """)
+        con.execute("""
+            ALTER TABLE brand_guideline_versions
+            ADD COLUMN IF NOT EXISTS logo_filename TEXT DEFAULT ''
+        """)
+        con.execute("""
+            ALTER TABLE brand_guideline_versions
+            ADD COLUMN IF NOT EXISTS logo_mime_type TEXT DEFAULT ''
+        """)
+        con.execute("""
+            ALTER TABLE content_reviews
+            ADD COLUMN IF NOT EXISTS user_id INTEGER
+        """)
+        con.execute("""
+            ALTER TABLE content_reviews
+            ADD COLUMN IF NOT EXISTS readability_json TEXT DEFAULT '{}'
+        """)
+
+        first = con.execute("""
+            SELECT id FROM brand_guideline_versions
+            ORDER BY id LIMIT 1
+        """).fetchone()
+
+        if not first:
+            old = con.execute("""
+                SELECT * FROM brand_guidelines WHERE id=1
+            """).fetchone()
+
+            values = (
+                old["brand_name"],
+                old["tone_of_voice"],
+                old["approved_colors"],
+                old["restricted_terms"],
+                old["approved_claims"]
+            ) if old else (
+                "My Brand",
+                "Professional, friendly and trustworthy",
+                json.dumps(["#0F766E", "#172554", "#FFFFFF"]),
+                json.dumps(["guaranteed", "100% free", "best in the world"]),
+                json.dumps(["Quality products", "Customer satisfaction"])
+            )
+
+            cur = con.execute("""
+                INSERT INTO brand_guideline_versions
+                (brand_name, tone_of_voice, approved_colors,
+                 restricted_terms, approved_claims, created_at)
+                VALUES (%s,%s,%s,%s,%s,%s)
+                RETURNING id
+            """, (*values, datetime.now().astimezone().isoformat(timespec="seconds")))
+
+            guideline_id = cur.fetchone()["id"]
+
+            con.execute("""
+                INSERT INTO app_settings(setting_key, setting_value)
+                VALUES (%s,%s)
+                ON CONFLICT(setting_key)
+                DO UPDATE SET setting_value=EXCLUDED.setting_value
+            """, ("active_guideline_id", str(guideline_id)))
+
+        elif not con.execute("""
+            SELECT 1 FROM app_settings
+            WHERE setting_key='active_guideline_id'
+        """).fetchone():
+
+            con.execute("""
+                INSERT INTO app_settings(setting_key, setting_value)
+                VALUES (%s,%s)
+                ON CONFLICT(setting_key)
+                DO UPDATE SET setting_value=EXCLUDED.setting_value
+            """, ("active_guideline_id", str(first["id"])))
+
+        demo_users = [
+            ("Judge Creator", "creator@brandguard.demo",
+             "CreatorDemo123!", "creator"),
+            ("Judge Brand Manager", "manager@brandguard.demo",
+             "ManagerDemo123!", "manager")
+        ]
+
+        for name, email, password, role in demo_users:
+            existing = con.execute(
+                "SELECT id FROM users WHERE email=%s", (email,)
+            ).fetchone()
+
+            if not existing:
+                con.execute("""
+                    INSERT INTO users(name,email,password_hash,role,created_at)
+                    VALUES (%s,%s,%s,%s,%s)
+                """, (
+                    name, email, hash_password(password), role,
+                    datetime.now().astimezone().isoformat(timespec="seconds")
+                ))
+
+    else:
+        # SQLite tables
+        con.execute("""CREATE TABLE IF NOT EXISTS brand_guidelines (
+            id INTEGER PRIMARY KEY, brand_name TEXT NOT NULL,
+            tone_of_voice TEXT NOT NULL, approved_colors TEXT NOT NULL,
+            restricted_terms TEXT NOT NULL, approved_claims TEXT NOT NULL
+        )""")
+
+        con.execute("""CREATE TABLE IF NOT EXISTS brand_guideline_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            brand_name TEXT NOT NULL,
+            tone_of_voice TEXT NOT NULL DEFAULT '',
+            approved_colors TEXT NOT NULL DEFAULT '[]',
+            restricted_terms TEXT NOT NULL DEFAULT '[]',
+            approved_claims TEXT NOT NULL DEFAULT '[]',
+            approved_terms TEXT NOT NULL DEFAULT '[]',
+            required_terms TEXT NOT NULL DEFAULT '[]',
+            brand_facts TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL
+        )""")
+
+        con.execute("""CREATE TABLE IF NOT EXISTS app_settings (
+            setting_key TEXT PRIMARY KEY,
+            setting_value TEXT NOT NULL
+        )""")
+
+        con.execute("""CREATE TABLE IF NOT EXISTS content_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            content_type TEXT NOT NULL,
+            submitted_content TEXT,
+            extracted_text TEXT,
+            issues_json TEXT NOT NULL,
+            total_issues INTEGER NOT NULL,
+            analysis_status TEXT NOT NULL,
+            decision TEXT NOT NULL DEFAULT 'Pending Human Review',
+            reviewer_note TEXT DEFAULT '',
+            image_filename TEXT DEFAULT '',
+            image_data BLOB,
+            created_at TEXT NOT NULL
+        )""")
+
+        con.execute("""CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('creator','manager')),
+            created_at TEXT NOT NULL
+        )""")
+
+        guideline_columns = [
+            r["name"] for r in
+            con.execute("PRAGMA table_info(brand_guideline_versions)").fetchall()
+        ]
+
+        for column in ("approved_terms", "required_terms", "brand_facts"):
+            if column not in guideline_columns:
+                con.execute(
+                    f"ALTER TABLE brand_guideline_versions ADD COLUMN "
+                    f"{column} TEXT NOT NULL DEFAULT '[]'"
+                )
+
+        if "logo_data" not in guideline_columns:
+            con.execute(
+                "ALTER TABLE brand_guideline_versions ADD COLUMN logo_data BLOB"
+            )
+
+        if "logo_filename" not in guideline_columns:
+            con.execute(
+                "ALTER TABLE brand_guideline_versions ADD COLUMN logo_filename TEXT DEFAULT ''"
+            )
+
+        if "logo_mime_type" not in guideline_columns:
+            con.execute(
+                "ALTER TABLE brand_guideline_versions ADD COLUMN logo_mime_type TEXT DEFAULT ''"
+            )
+
+        columns = [
+            r["name"] for r in
+            con.execute("PRAGMA table_info(content_reviews)").fetchall()
+        ]
+
+        if "user_id" not in columns:
+            con.execute(
+                "ALTER TABLE content_reviews ADD COLUMN user_id INTEGER"
+            )
+
+        if "readability_json" not in columns:
+            con.execute(
+                "ALTER TABLE content_reviews ADD COLUMN readability_json TEXT DEFAULT '{}'"
+            )
+
+        first = con.execute("""
+            SELECT id FROM brand_guideline_versions
+            ORDER BY id LIMIT 1
+        """).fetchone()
+
+        if not first:
+            old = con.execute(
+                "SELECT * FROM brand_guidelines WHERE id=1"
+            ).fetchone()
+
+            values = (
+                old["brand_name"], old["tone_of_voice"],
+                old["approved_colors"], old["restricted_terms"],
+                old["approved_claims"]
+            ) if old else (
+                "My Brand",
+                "Professional, friendly and trustworthy",
+                json.dumps(["#0F766E", "#172554", "#FFFFFF"]),
+                json.dumps(["guaranteed", "100% free", "best in the world"]),
+                json.dumps(["Quality products", "Customer satisfaction"])
+            )
+
+            cur = con.execute("""
+                INSERT INTO brand_guideline_versions
+                (brand_name, tone_of_voice, approved_colors,
+                 restricted_terms, approved_claims, created_at)
+                VALUES (?,?,?,?,?,?)
+            """, (*values, datetime.now().astimezone().isoformat(timespec="seconds")))
+
+            guideline_id = cur.lastrowid
+
+            con.execute("""
+                INSERT OR REPLACE INTO app_settings
+                VALUES ('active_guideline_id',?)
+            """, (str(guideline_id),))
+
+        elif not con.execute("""
+            SELECT 1 FROM app_settings
+            WHERE setting_key='active_guideline_id'
+        """).fetchone():
+
+            con.execute("""
+                INSERT INTO app_settings VALUES ('active_guideline_id',?)
+            """, (str(first["id"]),))
+
+        demo_users = [
+            ("Judge Creator", "creator@brandguard.demo",
+             "CreatorDemo123!", "creator"),
+            ("Judge Brand Manager", "manager@brandguard.demo",
+             "ManagerDemo123!", "manager")
+        ]
+
+        for name, email, password, role in demo_users:
+            if not con.execute(
+                "SELECT id FROM users WHERE email=?", (email,)
+            ).fetchone():
+                con.execute("""
+                    INSERT INTO users(name,email,password_hash,role,created_at)
+                    VALUES (?,?,?,?,?)
+                """, (
+                    name, email, hash_password(password), role,
+                    datetime.now().astimezone().isoformat(timespec="seconds")
+                ))
+
     con.commit()
     con.close()
+def get_table_columns(con, table_name):
+    if DATABASE_URL:
+        rows = con.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = %s
+        """, (table_name,)).fetchall()
 
+        return [row["column_name"] for row in rows]
+
+    rows = con.execute(
+        f"PRAGMA table_info({table_name})"
+    ).fetchall()
+
+    return [row["name"] for row in rows]
+
+def execute_query(con, query, params=()):
+    if DATABASE_URL:
+        query = query.replace("?", "%s")
+
+    return con.execute(query, params)
 initialize_database()
 
 
@@ -195,46 +501,105 @@ class ReviewDecisionRequest(BaseModel):
     decision: str
     reviewer_note: str = ""
 
+
 def current_user(authorization: Optional[str] = Header(default=None)):
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "Please log in to continue.")
+
     payload = read_token(authorization.split(" ", 1)[1].strip())
+
     if not payload:
         raise HTTPException(401, "Your session expired. Please log in again.")
+
     con = get_connection()
-    user = con.execute("SELECT id,name,email,role FROM users WHERE id=?", (payload["uid"],)).fetchone()
+
+    user = execute_query(
+        con,
+        "SELECT id,name,email,role FROM users WHERE id=?",
+        (payload["uid"],)
+    ).fetchone()
+
     con.close()
+
     if not user:
         raise HTTPException(401, "Account not found. Please log in again.")
+
     return dict(user)
 
 def manager_only(user=Depends(current_user)):
     if user["role"] != "manager":
-        raise HTTPException(403, "Only a Brand Manager / Reviewer can perform this action.")
+        raise HTTPException(
+            403,
+            "Only a Brand Manager / Reviewer can perform this action."
+        )
     return user
+
+
+@app.post("/auth/register")
 
 @app.post("/auth/register")
 def register_user(request: RegisterRequest):
     email = request.email.strip().lower()
+
     if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
         raise HTTPException(400, "Enter a valid email address.")
+
     con = get_connection()
+
     try:
-        cur = con.execute("""INSERT INTO users(name,email,password_hash,role,created_at)
-            VALUES(?,?,?,?,?)""", (request.name.strip(), email, hash_password(request.password),
-            "creator", datetime.now().astimezone().isoformat(timespec="seconds")))
+        values = (
+            request.name.strip(),
+            email,
+            hash_password(request.password),
+            "creator",
+            datetime.now().astimezone().isoformat(timespec="seconds")
+        )
+
+        if DATABASE_URL:
+            cur = con.execute("""
+                INSERT INTO users(name,email,password_hash,role,created_at)
+                VALUES (%s,%s,%s,%s,%s)
+                RETURNING id
+            """, values)
+
+            user_id = cur.fetchone()["id"]
+
+        else:
+            cur = con.execute("""
+                INSERT INTO users(name,email,password_hash,role,created_at)
+                VALUES (?,?,?,?,?)
+            """, values)
+
+            user_id = cur.lastrowid
+
         con.commit()
-        user = con.execute("SELECT id,name,email,role FROM users WHERE id=?", (cur.lastrowid,)).fetchone()
-        return {"token": issue_token(user), "user": dict(user), "message": "Creator account created."}
-    except sqlite3.IntegrityError:
-        raise HTTPException(409, "An account with this email already exists.")
+
+        user = execute_query(
+            con,
+            "SELECT id,name,email,role FROM users WHERE id=?",
+            (user_id,)
+        ).fetchone()
+
+        return {
+            "token": issue_token(user),
+            "user": dict(user),
+            "message": "Creator account created."
+        }
+
+    except (sqlite3.IntegrityError, psycopg.IntegrityError):
+        raise HTTPException(
+            409,
+            "An account with this email already exists."
+        )
+
     finally:
         con.close()
+
 
 @app.post("/auth/login")
 def login_user(request: LoginRequest):
     con = get_connection()
-    user = con.execute("SELECT * FROM users WHERE email=?", (request.email.strip().lower(),)).fetchone()
+    user = execute_query(con,"SELECT * FROM users WHERE email=?",(email.strip().lower(),)).fetchone()
     con.close()
     if not user or not verify_password(request.password, user["password_hash"]):
         raise HTTPException(401, "Email or password is incorrect.")
@@ -261,14 +626,24 @@ def row_to_guideline(row, selected):
             "logo_filename": row["logo_filename"] or "",
             "created_at": row["created_at"], "is_active": row["id"] == selected}
 
+
 def read_brand_guidelines():
     con = get_connection()
     selected = active_id(con)
-    row = con.execute("SELECT * FROM brand_guideline_versions WHERE id=?", (selected,)).fetchone()
+
+    row = execute_query(
+        con,
+        "SELECT * FROM brand_guideline_versions WHERE id=?",
+        (selected,)
+    ).fetchone() if selected is not None else None
+
     con.close()
+
     if not row:
         raise HTTPException(404, "Active brand guidelines not found.")
+
     return row_to_guideline(row, selected)
+
 
 @app.get("/brand-guidelines")
 def get_brand_guidelines(user=Depends(manager_only)):
@@ -283,34 +658,109 @@ def get_brand_guideline_history(user=Depends(manager_only)):
     return {"guidelines": [row_to_guideline(r, selected) for r in rows]}
 
 @app.post("/brand-guidelines")
+
+@app.post("/brand-guidelines")
 def create_brand_guidelines(g: BrandGuidelinesRequest, user=Depends(manager_only)):
     if not g.brand_name.strip():
         raise HTTPException(400, "Brand name cannot be empty.")
+
     con = get_connection()
-    cur = con.execute("""INSERT INTO brand_guideline_versions
-        (brand_name,tone_of_voice,approved_colors,restricted_terms,approved_claims,approved_terms,required_terms,brand_facts,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?)""", (g.brand_name.strip(), g.tone_of_voice.strip(), json.dumps(g.approved_colors),
-        json.dumps(g.restricted_terms), json.dumps(g.approved_claims), json.dumps(g.approved_terms),
-        json.dumps(g.required_terms), json.dumps(g.brand_facts), datetime.now().astimezone().isoformat(timespec="seconds")))
-    new_id = cur.lastrowid
-    con.execute("INSERT OR REPLACE INTO app_settings VALUES ('active_guideline_id',?)", (str(new_id),))
-    con.commit(); con.close()
-    return {"message": "New brand guideline saved and activated.", "id": new_id}
+
+    values = (
+        g.brand_name.strip(),
+        g.tone_of_voice.strip(),
+        json.dumps(g.approved_colors),
+        json.dumps(g.restricted_terms),
+        json.dumps(g.approved_claims),
+        json.dumps(g.approved_terms),
+        json.dumps(g.required_terms),
+        json.dumps(g.brand_facts),
+        datetime.now().astimezone().isoformat(timespec="seconds")
+    )
+
+    if DATABASE_URL:
+        cur = con.execute("""
+            INSERT INTO brand_guideline_versions
+            (brand_name,tone_of_voice,approved_colors,restricted_terms,
+             approved_claims,approved_terms,required_terms,brand_facts,created_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id
+        """, values)
+
+        new_id = cur.fetchone()["id"]
+
+        con.execute("""
+            INSERT INTO app_settings(setting_key,setting_value)
+            VALUES (%s,%s)
+            ON CONFLICT(setting_key)
+            DO UPDATE SET setting_value=EXCLUDED.setting_value
+        """, ("active_guideline_id", str(new_id)))
+
+    else:
+        cur = con.execute("""
+            INSERT INTO brand_guideline_versions
+            (brand_name,tone_of_voice,approved_colors,restricted_terms,
+             approved_claims,approved_terms,required_terms,brand_facts,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?)
+        """, values)
+
+        new_id = cur.lastrowid
+
+        con.execute("""
+            INSERT OR REPLACE INTO app_settings
+            VALUES ('active_guideline_id',?)
+        """, (str(new_id),))
+
+    con.commit()
+    con.close()
+
+    return {
+        "message": "New brand guideline saved and activated.",
+        "id": new_id
+    }
+
+
 
 @app.put("/brand-guidelines")
 def update_brand_guidelines(g: BrandGuidelinesRequest, user=Depends(manager_only)):
     if not g.brand_name.strip():
         raise HTTPException(400, "Brand name cannot be empty.")
-    con = get_connection(); selected = active_id(con)
+
+    con = get_connection()
+    selected = active_id(con)
+
     if selected is None:
-        con.close(); raise HTTPException(404, "No active guideline found.")
-    con.execute("""UPDATE brand_guideline_versions SET brand_name=?,tone_of_voice=?,approved_colors=?,
-        restricted_terms=?,approved_claims=?,approved_terms=?,required_terms=?,brand_facts=? WHERE id=?""",
-        (g.brand_name.strip(), g.tone_of_voice.strip(), json.dumps(g.approved_colors),
-         json.dumps(g.restricted_terms), json.dumps(g.approved_claims), json.dumps(g.approved_terms),
-         json.dumps(g.required_terms), json.dumps(g.brand_facts), selected))
-    con.commit(); con.close()
-    return {"message": "Active brand guidelines updated.", "id": selected}
+        con.close()
+        raise HTTPException(404, "No active guideline found.")
+
+    execute_query(
+        con,
+        """UPDATE brand_guideline_versions
+        SET brand_name=?, tone_of_voice=?, approved_colors=?,
+        restricted_terms=?, approved_claims=?, approved_terms=?,
+        required_terms=?, brand_facts=?
+        WHERE id=?""",
+        (
+            g.brand_name.strip(),
+            g.tone_of_voice.strip(),
+            json.dumps(g.approved_colors),
+            json.dumps(g.restricted_terms),
+            json.dumps(g.approved_claims),
+            json.dumps(g.approved_terms),
+            json.dumps(g.required_terms),
+            json.dumps(g.brand_facts),
+            selected
+        )
+    )
+
+    con.commit()
+    con.close()
+
+    return {
+        "message": "Active brand guidelines updated.",
+        "id": selected
+    }
+
 
 @app.post("/brand-guidelines/logo")
 async def upload_brand_logo(file: UploadFile = File(...), user=Depends(manager_only)):
@@ -328,28 +778,72 @@ async def upload_brand_logo(file: UploadFile = File(...), user=Depends(manager_o
     con = get_connection(); selected = active_id(con)
     if selected is None:
         con.close(); raise HTTPException(404, "No active brand profile found. Save a profile first.")
-    con.execute("UPDATE brand_guideline_versions SET logo_data=?,logo_filename=?,logo_mime_type=? WHERE id=?",
-                (data, file.filename or "brand-logo", file.content_type, selected))
+    execute_query(
+        con,
+        "UPDATE brand_guideline_versions SET logo_data=?,logo_filename=?,logo_mime_type=? WHERE id=?",
+        (data, file.filename or "brand-logo", file.content_type, selected)
+    )
     con.commit(); con.close()
     return {"message":"Brand logo uploaded successfully.", "filename":file.filename or "brand-logo"}
 
 @app.delete("/brand-guidelines/logo")
 def delete_brand_logo(user=Depends(manager_only)):
-    con = get_connection(); selected = active_id(con)
+    con = get_connection()
+    selected = active_id(con)
+
     if selected is None:
-        con.close(); raise HTTPException(404, "No active brand profile found.")
-    con.execute("UPDATE brand_guideline_versions SET logo_data=NULL,logo_filename='',logo_mime_type='' WHERE id=?", (selected,))
-    con.commit(); con.close()
-    return {"message":"Brand logo removed from the active profile."}
+        con.close()
+        raise HTTPException(404, "No active brand profile found.")
+
+    execute_query(
+        con,
+        """UPDATE brand_guideline_versions
+        SET logo_data=NULL, logo_filename='', logo_mime_type=''
+        WHERE id=?""",
+        (selected,)
+    )
+
+    con.commit()
+    con.close()
+
+    return {"message": "Brand logo removed from the active profile."}
+
 
 @app.post("/brand-guidelines/{guideline_id}/activate")
 def activate_guideline(guideline_id: int, user=Depends(manager_only)):
     con = get_connection()
-    if not con.execute("SELECT id FROM brand_guideline_versions WHERE id=?", (guideline_id,)).fetchone():
-        con.close(); raise HTTPException(404, "Guideline version not found.")
-    con.execute("INSERT OR REPLACE INTO app_settings VALUES ('active_guideline_id',?)", (str(guideline_id),))
-    con.commit(); con.close()
-    return {"message": "Guideline activated.", "id": guideline_id}
+
+    guideline = execute_query(
+        con,
+        "SELECT id FROM brand_guideline_versions WHERE id=?",
+        (guideline_id,)
+    ).fetchone()
+
+    if not guideline:
+        con.close()
+        raise HTTPException(404, "Guideline version not found.")
+
+    if DATABASE_URL:
+        con.execute("""
+            INSERT INTO app_settings(setting_key,setting_value)
+            VALUES (%s,%s)
+            ON CONFLICT(setting_key)
+            DO UPDATE SET setting_value=EXCLUDED.setting_value
+        """, ("active_guideline_id", str(guideline_id)))
+    else:
+        con.execute("""
+            INSERT OR REPLACE INTO app_settings
+            VALUES ('active_guideline_id',?)
+        """, (str(guideline_id),))
+
+    con.commit()
+    con.close()
+
+    return {
+        "message": "Guideline activated.",
+        "id": guideline_id
+    }
+
 
 def _normalise_phrase(value: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9% ]", " ", str(value).lower())).strip()
@@ -467,46 +961,115 @@ def check_brand_compliance(text):
 
     return issues
 
+
 def save_review(kind, submitted, extracted, issues, user_id, filename="", image_data=None, readability=None):
     con = get_connection()
-    cur = con.execute("""INSERT INTO content_reviews
-        (content_type,submitted_content,extracted_text,issues_json,total_issues,analysis_status,
-         image_filename,image_data,created_at,user_id,readability_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-        (kind, submitted, extracted, json.dumps(issues), len(issues),
-         "Needs Review" if issues else "Passed Basic Checks", filename, image_data,
-         datetime.now().astimezone().isoformat(timespec="seconds"), user_id, json.dumps(readability or {})))
-    rid = cur.lastrowid; con.commit(); con.close()
+
+    values = (
+        kind,
+        submitted,
+        extracted,
+        json.dumps(issues),
+        len(issues),
+        "Needs Review" if issues else "Passed Basic Checks",
+        filename,
+        image_data,
+        datetime.now().astimezone().isoformat(timespec="seconds"),
+        user_id,
+        json.dumps(readability or {})
+    )
+    if DATABASE_URL:
+        cur = con.execute("""
+            INSERT INTO content_reviews(content_type,submitted_content,extracted_text,issues_json,total_issues,analysis_status,image_filename,image_data,created_at,user_id,readability_json)VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)RETURNING id""", values)
+        rid = cur.fetchone()["id"]
+    else:
+        cur = con.execute("""
+            INSERT INTO content_reviews (content_type,submitted_content,extracted_text,issues_json,total_issues,analysis_status,image_filename,image_data,created_at,user_id,readability_json)VALUES (?,?,?,?,?,?,?,?,?,?,?)""", values)
+        rid = cur.lastrowid
+
+    con.commit()
+    con.close()
+
     return rid
 
 @app.get("/reviews")
 def get_reviews(user=Depends(current_user)):
     con = get_connection()
+
     if user["role"] == "manager":
-        rows = con.execute("""SELECT id,content_type,submitted_content,extracted_text,issues_json,total_issues,
-            analysis_status,decision,reviewer_note,image_filename,created_at,readability_json FROM content_reviews ORDER BY id DESC""").fetchall()
+        rows = execute_query(con, """
+            SELECT id,content_type,submitted_content,extracted_text,
+            issues_json,total_issues,analysis_status,decision,
+            reviewer_note,image_filename,created_at,readability_json
+            FROM content_reviews
+            ORDER BY id DESC
+        """).fetchall()
     else:
-        rows = con.execute("""SELECT id,content_type,submitted_content,extracted_text,issues_json,total_issues,
-            analysis_status,decision,reviewer_note,image_filename,created_at,readability_json FROM content_reviews
-            WHERE user_id=? ORDER BY id DESC""", (user["id"],)).fetchall()
+        rows = execute_query(con, """
+            SELECT id,content_type,submitted_content,extracted_text,
+            issues_json,total_issues,analysis_status,decision,
+            reviewer_note,image_filename,created_at,readability_json
+            FROM content_reviews
+            WHERE user_id=?
+            ORDER BY id DESC
+        """, (user["id"],)).fetchall()
+
     con.close()
-    return {"reviews": [{"id":r["id"],"type":r["content_type"],"submitted_content":r["submitted_content"] or "",
-        "extracted_text":r["extracted_text"] or "", "issues":json.loads(r["issues_json"] or "[]"),
-        "total_issues":r["total_issues"],"status":r["analysis_status"],
-        "decision":r["decision"] or "Pending Review","reviewer_note":r["reviewer_note"] or "",
-        "image_filename":r["image_filename"] or "","date":r["created_at"],
-        "readability":json.loads(r["readability_json"] or "{}") } for r in rows]}
+
+    return {
+        "reviews": [
+            {
+                "id": r["id"],
+                "type": r["content_type"],
+                "submitted_content": r["submitted_content"] or "",
+                "extracted_text": r["extracted_text"] or "",
+                "issues": json.loads(r["issues_json"] or "[]"),
+                "total_issues": r["total_issues"],
+                "status": r["analysis_status"],
+                "decision": r["decision"] or "Pending Review",
+                "reviewer_note": r["reviewer_note"] or "",
+                "image_filename": r["image_filename"] or "",
+                "date": r["created_at"],
+                "readability": json.loads(r["readability_json"] or "{}")
+            }
+            for r in rows
+        ]
+    }
+
+
 
 @app.delete("/reviews/{review_id}")
 def delete_review(review_id: int, user=Depends(current_user)):
     con = get_connection()
+
     if user["role"] == "manager":
-        cur = con.execute("DELETE FROM content_reviews WHERE id=?", (review_id,))
+        cur = execute_query(
+            con,
+            "DELETE FROM content_reviews WHERE id=?",
+            (review_id,)
+        )
     else:
-        cur = con.execute("DELETE FROM content_reviews WHERE id=? AND user_id=?", (review_id, user["id"]))
+        cur = execute_query(
+            con,
+            "DELETE FROM content_reviews WHERE id=? AND user_id=?",
+            (review_id, user["id"])
+        )
+
     if cur.rowcount == 0:
-        con.close(); raise HTTPException(404, "Review not found or you do not have permission to delete it.")
-    con.commit(); con.close()
-    return {"message": "Review deleted successfully.", "review_id": review_id}
+        con.close()
+        raise HTTPException(
+            404,
+            "Review not found or you do not have permission to delete it."
+        )
+
+    con.commit()
+    con.close()
+
+    return {
+        "message": "Review deleted successfully.",
+        "review_id": review_id
+    }
+
 
 
 @app.delete("/reviews")
@@ -514,51 +1077,99 @@ def clear_reviews(user=Depends(manager_only)):
     con = get_connection(); con.execute("DELETE FROM content_reviews"); con.commit(); con.close()
     return {"message": "Review history cleared. Brand guidelines were not changed."}
 
+
+
+
 @app.patch("/reviews/{review_id}/decision")
-def update_review_decision(review_id: int, request: ReviewDecisionRequest, user=Depends(manager_only)):
+def update_review_decision(
+    review_id: int,
+    request: ReviewDecisionRequest,
+    user=Depends(manager_only)
+):
     if request.decision not in ["Approved", "Revision Requested", "Rejected"]:
         raise HTTPException(400, "Invalid review decision.")
+
     con = get_connection()
-    cur = con.execute("UPDATE content_reviews SET decision=?,reviewer_note=? WHERE id=?",
-                      (request.decision, request.reviewer_note, review_id))
+
+    cur = execute_query(
+        con,
+        "UPDATE content_reviews SET decision=?, reviewer_note=? WHERE id=?",
+        (request.decision, request.reviewer_note, review_id)
+    )
+
     if cur.rowcount == 0:
-        con.close(); raise HTTPException(404, "Review not found.")
-    con.commit(); con.close()
-    return {"message":"Review decision saved.","review_id":review_id,"decision":request.decision}
+        con.close()
+        raise HTTPException(404, "Review not found.")
+
+    con.commit()
+    con.close()
+
+    return {
+        "message": "Review decision saved.",
+        "review_id": review_id,
+        "decision": request.decision
+    }
+
 
 @app.get("/analytics")
 def get_analytics(user=Depends(current_user)):
     con = get_connection()
+
     if user["role"] == "manager":
-        rows = con.execute("SELECT decision,content_type,total_issues,issues_json,created_at FROM content_reviews").fetchall()
+        rows = execute_query(
+            con,
+            "SELECT decision, content_type, total_issues, issues_json, created_at FROM content_reviews"
+        ).fetchall()
     else:
-        rows = con.execute("SELECT decision,content_type,total_issues,issues_json,created_at FROM content_reviews WHERE user_id=?", (user["id"],)).fetchall()
+        rows = execute_query(
+            con,
+            "SELECT decision, content_type, total_issues, issues_json, created_at FROM content_reviews WHERE user_id=?",
+            (user["id"],)
+        ).fetchall()
+
     con.close()
-    decisions = {"Pending":0,"Approved":0,"Revision Requested":0,"Rejected":0}
-    types = {"Text":0,"Image":0}
-    severity = {"high":0,"medium":0,"low":0}
+
+    decisions = {"Pending": 0, "Approved": 0, "Revision Requested": 0, "Rejected": 0}
+    types = {"Text": 0, "Image": 0}
+    severity = {"high": 0, "medium": 0, "low": 0}
     daily = {}
+
     for row in rows:
         decision = row["decision"] or "Pending Human Review"
+
         if decision in ("Pending", "Pending Review", "Pending Human Review"):
             decisions["Pending"] += 1
         elif decision in decisions:
             decisions[decision] += 1
+
         kind = row["content_type"] or "Other"
         types[kind] = types.get(kind, 0) + 1
+
         try:
             issues = json.loads(row["issues_json"] or "[]")
         except Exception:
             issues = []
+
         for issue in issues:
             level = str(issue.get("severity", "medium")).lower()
             severity[level] = severity.get(level, 0) + 1
+
         day = (row["created_at"] or "")[:10]
         if day:
             daily[day] = daily.get(day, 0) + 1
-    return {"total_reviews":len(rows),"decisions":decisions,"content_types":types,
-            "severity":severity,"total_issues":sum(severity.values()),
-            "daily_reviews":[{"date":k,"count":v} for k,v in sorted(daily.items())[-7:]]}
+
+    return {
+        "total_reviews": len(rows),
+        "decisions": decisions,
+        "content_types": types,
+        "severity": severity,
+        "total_issues": sum(severity.values()),
+        "daily_reviews": [
+            {"date": k, "count": v}
+            for k, v in sorted(daily.items())[-7:]
+        ]
+    }
+
 
 @app.get("/")
 def home():
@@ -568,62 +1179,492 @@ def home():
 def health():
     return {"status":"Backend is running"}
 
+
+
+
+def analyze_brand_colors(image, approved_colors):
+    if not approved_colors:
+        return {
+            "status": "No brand colours configured",
+            "approved_colors": [],
+            "detected_colors": [],
+            "message": "Please add approved brand colours to the guidelines."
+        }
+
+    # Resize image for faster processing
+    resized = cv2.resize(image, (150, 150))
+
+    # Convert RGB to a list of pixels
+    pixels = resized.reshape((-1, 3)).astype(np.float32)
+
+    # Detect dominant colours using K-means
+    criteria = (
+        cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+        20,
+        1.0
+    )
+
+    _, labels, centers = cv2.kmeans(
+        pixels,
+        5,
+        None,
+        criteria,
+        3,
+        cv2.KMEANS_PP_CENTERS
+    )
+
+    detected_colors = []
+
+    for center in centers:
+        rgb = [int(value) for value in center]
+        hex_color = "#{:02X}{:02X}{:02X}".format(*rgb)
+        detected_colors.append(hex_color)
+
+    # Convert approved colours to uppercase
+    approved = [
+        color.strip().upper()
+        for color in approved_colors
+        if isinstance(color, str) and color.strip()
+    ]
+
+    # Compare detected and approved colours
+    def color_distance(color1, color2):
+        rgb1 = np.array([
+            int(color1[i:i+2], 16)
+            for i in (1, 3, 5)
+        ])
+
+        rgb2 = np.array([
+            int(color2[i:i+2], 16)
+            for i in (1, 3, 5)
+        ])
+
+        return float(np.linalg.norm(rgb1 - rgb2))
+
+    matches = []
+
+    for detected in detected_colors:
+        closest = min(
+            approved,
+            key=lambda color: color_distance(detected, color)
+        )
+
+        distance = color_distance(detected, closest)
+
+        matches.append({
+            "detected": detected,
+            "closest_approved": closest,
+            "distance": round(distance, 2),
+            "match": distance <= 60
+        })
+
+    matched_count = sum(item["match"] for item in matches)
+
+    status = (
+        "Good match"
+        if matched_count == len(matches)
+        else "Possible colour mismatch"
+    )
+
+    return {
+        "status": status,
+        "approved_colors": approved,
+        "detected_colors": detected_colors,
+        "matches": matches,
+        "matched_count": matched_count,
+        "total_detected": len(matches)
+    }
+
+
 @app.post("/analyze")
 def analyze_content(request: ContentRequest, user=Depends(current_user)):
     content = request.content.strip()
-    if not content: raise HTTPException(400, "Please enter content to analyze.")
-    issues = check_brand_compliance(content)
-    if len(content) < 10:
-        issues.append({"word":"Short content","rule":"Minimum content length",
-            "message":"Your content is too short to review properly.","suggestion":"Provide more information."})
-    rid = save_review("Text", content, "", issues, user["id"])
-    return {"review_id":rid,"status":"Needs Review" if issues else "Passed Basic Checks",
-            "total_issues":len(issues),"issues":issues}
 
-def assess_poster_readability(image_array, ocr_results):
-    """Heuristic visual/readability checks; estimates only, not exact font-size measurement."""
+    if not content:
+        raise HTTPException(400, "Please enter content to analyze.")
+
+    # Existing rule-based analysis
+    issues = check_brand_compliance(content)
+
+    for issue in issues:
+        issue["source"] = "Rule-based"
+
+    # Gemini AI analysis
+    ai_issues = analyze_with_gemini(content)
+
+    existing_messages = {
+        issue.get("message", "").strip().lower()
+        for issue in issues
+    }
+
+    for issue in ai_issues:
+        message = issue["message"].strip().lower()
+
+        if message not in existing_messages:
+            issue["source"] = "Gemini AI"
+            issues.append(issue)
+            existing_messages.add(message)
+    if len(content) < 10:
+        issues.append({
+            "word": "Short content",
+            "rule": "Minimum content length",
+            "message": "Your content is too short to review properly.",
+            "suggestion": "Provide more information."
+        })
+
+    rid = save_review("Text", content, "", issues, user["id"])
+
+    return {
+        "review_id": rid,
+        "status": "Needs Review" if issues else "Passed Basic Checks",
+        "total_issues": len(issues),
+        "issues": issues
+    }
+def analyze_text_contrast(image_array, ocr_results):
     height, width = image_array.shape[:2]
-    confidences = [max(0.0, min(1.0, float(item[2]))) for item in ocr_results if len(item) > 2]
+    results = []
+
+    def luminance(rgb):
+        rgb = np.array(rgb, dtype=np.float64) / 255.0
+        linear = np.where(
+            rgb <= 0.04045,
+            rgb / 12.92,
+            ((rgb + 0.055) / 1.055) ** 2.4
+        )
+        return float(
+            0.2126 * linear[0] +
+            0.7152 * linear[1] +
+            0.0722 * linear[2]
+        )
+
+    for item in ocr_results:
+        try:
+            points = item[0]
+
+            xs = [int(point[0]) for point in points]
+            ys = [int(point[1]) for point in points]
+
+            x1 = max(0, min(xs))
+            y1 = max(0, min(ys))
+            x2 = min(width, max(xs))
+            y2 = min(height, max(ys))
+
+            if x2 - x1 < 5 or y2 - y1 < 5:
+                continue
+
+            # Text region
+            crop = image_array[y1:y2, x1:x2]
+
+            # Surrounding area used to estimate background
+            pad = max(3, int(min(x2 - x1, y2 - y1) * 0.15))
+
+            outer = image_array[
+                max(0, y1 - pad):min(height, y2 + pad),
+                max(0, x1 - pad):min(width, x2 + pad)
+            ]
+
+            if crop.size == 0 or outer.size == 0:
+                continue
+
+            # Estimate background from the outer region
+            background_rgb = np.median(
+                outer.reshape(-1, 3), axis=0
+            )
+
+            background_lum = luminance(background_rgb)
+
+            # Estimate text from pixels most different from background
+            pixels = crop.reshape(-1, 3).astype(np.float64)
+
+            pixel_luminance = (
+                0.2126 * pixels[:, 0] +
+                0.7152 * pixels[:, 1] +
+                0.0722 * pixels[:, 2]
+            )
+
+            pixel_luminance = pixel_luminance / 255.0
+
+            difference = np.abs(pixel_luminance - background_lum)
+
+            selected_count = max(1, int(len(pixels) * 0.20))
+            selected_indices = np.argsort(difference)[-selected_count:]
+
+            foreground_rgb = np.median(
+                pixels[selected_indices], axis=0
+            )
+
+            foreground_lum = luminance(foreground_rgb)
+
+            lighter = max(background_lum, foreground_lum)
+            darker = min(background_lum, foreground_lum)
+
+            ratio = (lighter + 0.05) / (darker + 0.05)
+
+            results.append({
+                "text": str(item[1]),
+                "contrast_ratio": round(ratio, 2),
+                "wcag_aa_normal": ratio >= 4.5,
+                "wcag_aa_large": ratio >= 3.0,
+                "estimated": True
+            })
+
+        except Exception:
+            continue
+
+    low_contrast = [
+        result for result in results
+        if not result["wcag_aa_large"]
+    ]
+
+    normal_text_pass = sum(
+        result["wcag_aa_normal"] for result in results
+    )
+
+    large_text_pass = sum(
+        result["wcag_aa_large"] for result in results
+    )
+
+    return {
+        "status": (
+            "No text regions available"
+            if not results
+            else "Review recommended"
+            if low_contrast
+            else "No low-contrast regions detected"
+        ),
+        "regions_checked": len(results),
+        "normal_text_pass": normal_text_pass,
+        "large_text_pass": large_text_pass,
+        "low_contrast_count": len(low_contrast),
+        "results": results,
+        "note": (
+            "Contrast values are approximate estimates from OCR regions. "
+            "They are not certified WCAG measurements."
+        )
+    }
+def assess_poster_readability(image_array, ocr_results):
+    """Automated poster readability and accessibility estimates."""
+
+    height, width = image_array.shape[:2]
+
+    confidences = [
+        max(0.0, min(1.0, float(item[2])))
+        for item in ocr_results
+        if len(item) > 2
+    ]
+
     box_heights = []
+
     for item in ocr_results:
         try:
             ys = [float(point[1]) for point in item[0]]
             box_heights.append(max(ys) - min(ys))
         except Exception:
             pass
-    avg_conf = round((sum(confidences) / len(confidences)) * 100, 1) if confidences else 0.0
-    smallest_pct = round((min(box_heights) / max(height, 1)) * 100, 2) if box_heights else None
+
+    avg_conf = (
+        round((sum(confidences) / len(confidences)) * 100, 1)
+        if confidences else 0.0
+    )
+
+    smallest_pct = (
+        round((min(box_heights) / max(height, 1)) * 100, 2)
+        if box_heights else None
+    )
+
     text = " ".join(item[1] for item in ocr_results)
     char_count = len(text.strip())
     block_count = len(ocr_results)
+
     gray = np.mean(image_array, axis=2)
     contrast_spread = float(np.std(gray))
+
     findings = []
     suggestions = []
+
     if not block_count:
         findings.append("No readable text was detected by OCR.")
-        suggestions.append("Use a sharper, higher-resolution image and ensure text is not obscured or heavily stylised.")
+        suggestions.append(
+            "Use a sharper, higher-resolution image and ensure text is visible."
+        )
+
     elif avg_conf < 65:
-        findings.append("OCR confidence is low, so some poster wording may be difficult to read automatically.")
-        suggestions.append("Use clearer typography, sharper text edges and less decorative lettering.")
+        findings.append(
+            "OCR confidence is low, so some poster wording may be difficult to read."
+        )
+        suggestions.append(
+            "Use clearer typography, sharper text edges and less decorative lettering."
+        )
+
     if smallest_pct is not None and smallest_pct < 1.2:
-        findings.append("Some detected text appears small relative to the poster height.")
-        suggestions.append("Increase the size of small captions, dates, contact details and call-to-action text.")
+        findings.append(
+            "Some detected text appears small relative to the poster height."
+        )
+        suggestions.append(
+            "Increase the size of small captions, dates and contact details."
+        )
+
     if char_count > 650 or block_count > 28:
-        findings.append("The poster may contain a high amount of text or many separate text blocks.")
-        suggestions.append("Shorten supporting copy, group related details and keep one clear main message.")
+        findings.append(
+            "The poster may contain too much text or too many separate text blocks."
+        )
+        suggestions.append(
+            "Shorten supporting copy and keep one clear main message."
+        )
+
     if contrast_spread < 35:
-        findings.append("The image has a low overall brightness variation; text/background contrast may need a manual check.")
-        suggestions.append("Check that text stands out clearly from its background; use stronger foreground/background contrast.")
+        findings.append(
+            "The image has low overall brightness variation; check text contrast manually."
+        )
+        suggestions.append(
+            "Use stronger foreground and background contrast."
+        )
+
+    contrast_analysis = analyze_text_contrast(
+        image_array,
+        ocr_results
+    )
+
+    if contrast_analysis["low_contrast_count"] > 0:
+        findings.append(
+            "Some detected text regions may have insufficient foreground/background contrast."
+        )
+        suggestions.append(
+            "Increase contrast between text and background."
+        )
+
     if not findings:
-        findings.append("No major readability warning was detected by these automated estimates.")
-        suggestions.append("Still inspect the poster at phone-screen size and verify every word manually.")
-    return {"ocr_confidence": avg_conf, "text_blocks": block_count, "character_count": char_count,
-        "smallest_text_height_percent": smallest_pct, "contrast_spread_estimate": round(contrast_spread, 1),
-        "findings": findings, "suggestions": suggestions,
-        "note": "These are automated estimates, not a guarantee of accessibility or exact font-size measurement."}
+        findings.append(
+            "No major readability warning was detected by these automated estimates."
+        )
+        suggestions.append(
+            "Inspect the poster at phone-screen size and verify every word manually."
+        )
 
+    return {
+        "ocr_confidence": avg_conf,
+        "text_blocks": block_count,
+        "character_count": char_count,
+        "smallest_text_height_percent": smallest_pct,
+        "contrast_spread_estimate": round(contrast_spread, 1),
+        "contrast_analysis": contrast_analysis,
+        "findings": findings,
+        "suggestions": suggestions,
+        "note": (
+            "These are automated estimates, not a guarantee of accessibility "
+            "or exact font-size measurement."
+        )
+    }
 
+def analyze_with_gemini(content):
+    """Use Gemini to provide additional brand-content analysis."""
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+
+    if not api_key:
+        return []
+
+    try:
+        guidelines = read_brand_guidelines()
+
+        if not guidelines:
+            return []
+
+        brand_context = {
+            "brand_name": guidelines.get("brand_name"),
+            "tone_of_voice": guidelines.get("tone_of_voice"),
+            "restricted_terms": guidelines.get("restricted_terms", []),
+            "approved_terms": guidelines.get("approved_terms", []),
+            "required_terms": guidelines.get("required_terms", []),
+            "approved_claims": guidelines.get("approved_claims", []),
+            "brand_facts": guidelines.get("brand_facts", [])
+        }
+
+        client = genai.Client(api_key=api_key)
+
+        prompt = f"""
+You are a professional brand governance assistant.
+
+Analyze the following marketing content using ONLY the supplied
+brand guidelines.
+
+Brand guidelines:
+{json.dumps(brand_context)}
+
+Content:
+{content}
+
+Identify additional issues such as:
+- Brand tone inconsistencies
+- Misleading or unsupported claims
+- Inappropriate marketing language
+- Brand messaging inconsistencies
+
+Do not invent brand rules or claim that facts have been externally verified.
+Do not repeat obvious issues already covered by the supplied rules.
+
+Return valid JSON in this exact format:
+{{
+  "issues": [
+    {{
+      "word": "Relevant word or phrase",
+      "rule": "Issue category",
+      "message": "Explain the problem",
+      "suggestion": "Give a practical improvement",
+      "severity": "High"
+    }}
+  ]
+}}
+
+Use only High, Medium, or Low for severity.
+Return an empty issues array if no additional problems are found.
+Return no more than 8 issues.
+"""
+
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config={"response_mime_type": "application/json"}
+        )
+
+        result = json.loads(response.text)
+        ai_issues = result.get("issues", [])
+
+        if not isinstance(ai_issues, list):
+            return []
+
+        valid_issues = []
+
+        for issue in ai_issues[:8]:
+            if not isinstance(issue, dict):
+                continue
+
+            required_fields = ["word", "rule", "message", "suggestion"]
+
+            if not all(
+                isinstance(issue.get(field), str) and issue[field].strip()
+                for field in required_fields
+            ):
+                continue
+
+            severity = issue.get("severity", "Medium")
+            if severity not in ["High", "Medium", "Low"]:
+                severity = "Medium"
+
+            valid_issues.append({
+                "word": issue["word"].strip(),
+                "rule": issue["rule"].strip(),
+                "message": issue["message"].strip(),
+                "suggestion": issue["suggestion"].strip(),
+                "severity": severity
+            })
+
+        return valid_issues
+
+    except Exception as error:
+        print("Gemini analysis unavailable:", error)
+        return []
 
 def compare_poster_logo(poster_image, logo_bytes):
     """Conservative logo comparison using ORB and geometric verification."""
@@ -1029,46 +2070,182 @@ def run_improved_ocr(image):
 
     return results
 
-
 @app.post("/analyze-image")
 async def analyze_image(file: UploadFile = File(...), user=Depends(current_user)):
-    if file.content_type not in ["image/jpeg","image/png","image/webp"]:
+    if file.content_type not in ["image/jpeg", "image/png", "image/webp"]:
         raise HTTPException(400, "Only JPG, PNG and WebP images are allowed.")
+
     data = await file.read()
-    if not data: raise HTTPException(400, "The uploaded image is empty.")
-    if len(data) > 5*1024*1024: raise HTTPException(400, "Image must be smaller than 5 MB.")
+
+    if not data:
+        raise HTTPException(400, "The uploaded image is empty.")
+
+    if len(data) > 5 * 1024 * 1024:
+        raise HTTPException(400, "Image must be smaller than 5 MB.")
+
     try:
         image = Image.open(io.BytesIO(data)).convert("RGB")
         image_array = np.array(image)
+
+        # Step 1: Extract text using OCR
         results = run_improved_ocr(image)
         extracted = " ".join(item[1] for item in results)
+
+        # Step 2: Existing rule-based analysis
         issues = check_brand_compliance(extracted)
+
+        for issue in issues:
+            issue["source"] = "Rule-based"
+
+        # Step 3: Gemini AI analysis
+        if extracted.strip():
+            ai_issues = analyze_with_gemini(extracted)
+
+            existing_messages = {
+                issue.get("message", "").strip().lower()
+                for issue in issues
+            }
+
+            for issue in ai_issues:
+                message = issue.get("message", "").strip().lower()
+
+                if message and message not in existing_messages:
+                    issue["source"] = "Gemini AI"
+                    issues.append(issue)
+                    existing_messages.add(message)
+
+        # Step 4: Check poster readability
         readability = assess_poster_readability(image_array, results)
+        guidelines = read_brand_guidelines()
+        color_analysis = analyze_brand_colors(
+        image_array,
+        guidelines["approved_colors"]
+)
+
+        readability["color_analysis"] = color_analysis
+
+           # Add warning when brand colours do not match
+        if color_analysis["status"] == "Possible colour mismatch":
+           issues.append({
+        "word": "Brand colours",
+        "rule": "Visual identity / brand colour consistency",
+        "severity": "medium",
+        "source": "Brand colour analysis",
+        "message": "Some dominant poster colours differ from the approved brand palette.",
+        "suggestion": "Review the poster colours and use the approved brand colours where appropriate."
+    })
+         # Step 5: Load active brand logo and guidelines
         con = get_connection()
-        selected = active_id(con)
-        logo_row = con.execute("SELECT brand_name,logo_data,logo_filename FROM brand_guideline_versions WHERE id=?", (selected,)).fetchone()
-        con.close()
-        logo_match = compare_poster_logo(image, logo_row["logo_data"] if logo_row else None)
-        logo_match["official_logo_filename"] = (logo_row["logo_filename"] or "") if logo_row else ""
-        brand_name_match = check_poster_brand_name(logo_row["brand_name"] if logo_row else "", results, image.size)
+        try:
+            selected = active_id(con)
+            logo_row = execute_query(
+                con,
+                "SELECT brand_name, logo_data, logo_filename "
+                "FROM brand_guideline_versions WHERE id=?",
+                (selected,)
+            ).fetchone() if selected is not None else None
+        finally:
+            con.close()
+
+
+        # Step 6: Compare official logo
+        logo_match = compare_poster_logo(
+            image,
+            logo_row["logo_data"] if logo_row else None
+        )
+
+        logo_match["official_logo_filename"] = (
+            logo_row["logo_filename"] or ""
+        ) if logo_row else ""
+
+        brand_name_match = check_poster_brand_name(
+            logo_row["brand_name"] if logo_row else "",
+            results,
+            image.size
+        )
+
         logo_match["brand_name_check"] = brand_name_match
         readability["logo_match"] = logo_match
+
+        # Step 7: Check brand name mismatch
         if brand_name_match["status"] == "Possible mismatch":
-            issues.append({"word": brand_name_match["detected_text"], "rule": "Brand identity / brand-name consistency", "severity": "high",
+            issues.append({
+                "word": brand_name_match["detected_text"],
+                "rule": "Brand identity / brand-name consistency",
+                "severity": "high",
+                "source": "Logo and brand identity check",
                 "message": brand_name_match["note"],
-                "suggestion": "Confirm that the poster belongs to the active brand. Replace the other brand name with the approved brand name if this is an accidental mix-up."})
+                "suggestion": (
+                    "Confirm that the poster belongs to the active brand. "
+                    "Replace the other brand name with the approved brand name "
+                    "if this is an accidental mix-up."
+                )
+            })
+
+        # Step 8: Check logo detection
         if logo_match["status"] == "Not detected":
-            issues.append({"word":"Official brand logo", "rule":"Visual identity / logo consistency", "severity":"medium",
-                "message":"The saved official logo was not confidently detected in this poster.",
-                "suggestion":"Check whether the correct official logo is present and clearly visible. If it is present but altered, ask the Brand Manager to verify it."})
+            issues.append({
+                "word": "Official brand logo",
+                "rule": "Visual identity / logo consistency",
+                "severity": "medium",
+                "source": "Logo verification",
+                "message": (
+                    "The saved official logo was not confidently detected "
+                    "in this poster."
+                ),
+                "suggestion": (
+                    "Check whether the correct official logo is present "
+                    "and clearly visible. If it is present but altered, "
+                    "ask the Brand Manager to verify it."
+                )
+            })
+
         elif logo_match["status"] == "Possible match":
-            issues.append({"word":"Official brand logo", "rule":"Visual identity / logo consistency", "severity":"low",
-                "message":"A possible version of the official logo was found, but the visual match is uncertain.",
-                "suggestion":"Ask the Brand Manager to compare the poster logo with the saved official logo."})
-        rid = save_review("Image", file.filename or "Uploaded image", extracted, issues,
-                          user["id"], file.filename or "uploaded-image", data, readability)
-        return {"review_id":rid,"message":"Image analyzed successfully!","filename":file.filename,
-            "extracted_text":extracted,"total_issues":len(issues),"readability":readability,"ocr_method":"Original + enhanced image OCR with duplicate merging",
-            "status":"Needs Review" if issues else "Passed Basic Checks","issues":issues}
-    except HTTPException: raise
-    except Exception as exc: raise HTTPException(400, f"Image analysis failed: {str(exc)}")
+            issues.append({
+                "word": "Official brand logo",
+                "rule": "Visual identity / logo consistency",
+                "severity": "low",
+                "source": "Logo verification",
+                "message": (
+                    "A possible version of the official logo was found, "
+                    "but the visual match is uncertain."
+                ),
+                "suggestion": (
+                    "Ask the Brand Manager to compare the poster logo "
+                    "with the saved official logo."
+                )
+            })
+
+        # Step 9: Save analysis report
+        rid = save_review(
+            "Image",
+            file.filename or "Uploaded image",
+            extracted,
+            issues,
+            user["id"],
+            file.filename or "uploaded-image",
+            data,
+            readability
+        )
+
+        return {
+            "review_id": rid,
+            "message": "Image analyzed successfully!",
+            "filename": file.filename,
+            "extracted_text": extracted,
+            "total_issues": len(issues),
+            "readability": readability,
+            "color_analysis": color_analysis,
+            "ocr_method": "Original + enhanced image OCR with duplicate merging",
+            "status": "Needs Review" if issues else "Passed Basic Checks",
+            "issues": issues
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        raise HTTPException(
+            400,
+            f"Image analysis failed: {str(exc)}"
+        )
