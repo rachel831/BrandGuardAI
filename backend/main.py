@@ -116,6 +116,21 @@ def initialize_database():
                 approved_claims TEXT NOT NULL
             )
         """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS organizations (
+                id BIGSERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS organization_settings (
+                organization_id BIGINT NOT NULL REFERENCES organizations(id),
+                setting_key TEXT NOT NULL,
+                setting_value TEXT NOT NULL,
+                PRIMARY KEY (organization_id, setting_key)
+            )
+        """)
 
         con.execute("""
             CREATE TABLE IF NOT EXISTS brand_guideline_versions (
@@ -177,6 +192,7 @@ def initialize_database():
             ALTER TABLE brand_guideline_versions
             ADD COLUMN IF NOT EXISTS approved_terms TEXT NOT NULL DEFAULT '[]'
         """)
+        
         con.execute("""
             ALTER TABLE brand_guideline_versions
             ADD COLUMN IF NOT EXISTS required_terms TEXT NOT NULL DEFAULT '[]'
@@ -205,7 +221,50 @@ def initialize_database():
             ALTER TABLE content_reviews
             ADD COLUMN IF NOT EXISTS readability_json TEXT DEFAULT '{}'
         """)
+                # Add organization ownership
+        con.execute("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS organization_id BIGINT
+        """)
 
+        con.execute("""
+            ALTER TABLE brand_guideline_versions
+            ADD COLUMN IF NOT EXISTS organization_id BIGINT
+        """)
+
+        con.execute("""
+            ALTER TABLE content_reviews
+            ADD COLUMN IF NOT EXISTS organization_id BIGINT
+        """)
+
+        # Create the existing default organization
+        con.execute("""
+            INSERT INTO organizations (name, created_at)
+            SELECT %s, %s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM organizations WHERE name = %s
+            )
+        """, (
+            "GreenBite Foods",
+            datetime.now().astimezone().isoformat(timespec="seconds"),
+            "GreenBite Foods"
+        ))
+
+        organization = con.execute("""
+            SELECT id FROM organizations
+            WHERE name = %s
+            ORDER BY id LIMIT 1
+        """, ("GreenBite Foods",)).fetchone()
+
+        organization_id = organization["id"]
+
+        # Assign existing records to GreenBite Foods
+        for table in ("users", "brand_guideline_versions", "content_reviews"):
+            con.execute(
+                f"UPDATE {table} SET organization_id = %s "
+                "WHERE organization_id IS NULL",
+                (organization_id,)
+            )
         first = con.execute("""
             SELECT id FROM brand_guideline_versions
             ORDER BY id LIMIT 1
@@ -258,7 +317,16 @@ def initialize_database():
                 ON CONFLICT(setting_key)
                 DO UPDATE SET setting_value=EXCLUDED.setting_value
             """, ("active_guideline_id", str(first["id"])))
-
+                    # Preserve GreenBite Foods' active guideline in organization settings
+        con.execute("""
+            INSERT INTO organization_settings
+                (organization_id, setting_key, setting_value)
+            SELECT %s, setting_key, setting_value
+            FROM app_settings
+            WHERE setting_key = 'active_guideline_id'
+            ON CONFLICT (organization_id, setting_key)
+            DO NOTHING
+        """, (organization_id,))
         demo_users = [
             ("Judge Creator", "creator@brandguard.demo",
              "CreatorDemo123!", "creator"),
@@ -438,6 +506,7 @@ def initialize_database():
 
     con.commit()
     con.close()
+            
 def get_table_columns(con, table_name):
     if DATABASE_URL:
         rows = con.execute("""
@@ -482,10 +551,20 @@ class RegisterRequest(BaseModel):
     name: str = Field(min_length=2, max_length=100)
     email: str = Field(min_length=5, max_length=254)
     password: str = Field(min_length=8, max_length=128)
+    organization_name: str = Field(
+        default="My Organization",
+        min_length=2,
+        max_length=100
+    )
 
 class LoginRequest(BaseModel):
     email: str
     password: str
+    
+class CreateManagerRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=100)
+    email: str = Field(min_length=5, max_length=254)
+    password: str = Field(min_length=8, max_length=128)    
 
 class ContentRequest(BaseModel):
     content: str
@@ -518,7 +597,7 @@ def current_user(authorization: Optional[str] = Header(default=None)):
 
     user = execute_query(
         con,
-        "SELECT id,name,email,role FROM users WHERE id=?",
+        "SELECT id,name,email,role,organization_id FROM users WHERE id=?",
         (payload["uid"],)
     ).fetchone()
 
@@ -539,57 +618,99 @@ def manager_only(user=Depends(current_user)):
 
 
 @app.post("/auth/register")
-
-@app.post("/auth/register")
 def register_user(request: RegisterRequest):
     email = request.email.strip().lower()
+    organization_name = request.organization_name.strip()
 
     if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
         raise HTTPException(400, "Enter a valid email address.")
 
+    if len(organization_name) < 2:
+        raise HTTPException(400, "Enter a valid organization name.")
+
     con = get_connection()
 
     try:
-        values = (
-            request.name.strip(),
-            email,
-            hash_password(request.password),
-            "creator",
-            datetime.now().astimezone().isoformat(timespec="seconds")
+        created_at = datetime.now().astimezone().isoformat(
+            timespec="seconds"
         )
 
         if DATABASE_URL:
-            cur = con.execute("""
-                INSERT INTO users(name,email,password_hash,role,created_at)
-                VALUES (%s,%s,%s,%s,%s)
+            org = con.execute("""
+                INSERT INTO organizations(name, created_at)
+                VALUES (%s, %s)
                 RETURNING id
-            """, values)
+            """, (organization_name, created_at)).fetchone()
+
+            organization_id = org["id"]
+
+            cur = con.execute("""
+                INSERT INTO users(
+                    name, email, password_hash, role,
+                    created_at, organization_id
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (
+                request.name.strip(),
+                email,
+                hash_password(request.password),
+                "creator",
+                created_at,
+                organization_id
+            ))
 
             user_id = cur.fetchone()["id"]
+            # Create default brand guidelines for the new organization
+            guideline = con.execute("""
+                INSERT INTO brand_guideline_versions (
+                    brand_name, tone_of_voice, approved_colors,
+                    restricted_terms, approved_claims, approved_terms,
+                    required_terms, brand_facts, created_at, organization_id
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (
+                organization_name,
+                "Professional and friendly",
+                "[]", "[]", "[]", "[]", "[]", "[]",
+                created_at,
+                organization_id
+            )).fetchone()
+
+            con.execute("""
+                INSERT INTO organization_settings (
+                    organization_id, setting_key, setting_value
+                )
+                VALUES (%s, %s, %s)
+            """, (
+                organization_id,
+                "active_guideline_id",
+                str(guideline["id"])
+            ))
 
         else:
-            cur = con.execute("""
-                INSERT INTO users(name,email,password_hash,role,created_at)
-                VALUES (?,?,?,?,?)
-            """, values)
-
-            user_id = cur.lastrowid
+            raise HTTPException(
+                500,
+                "Organization registration requires PostgreSQL."
+            )
 
         con.commit()
 
         user = execute_query(
             con,
-            "SELECT id,name,email,role FROM users WHERE id=?",
+            "SELECT id,name,email,role,organization_id FROM users WHERE id=?",
             (user_id,)
         ).fetchone()
 
         return {
             "token": issue_token(user),
             "user": dict(user),
-            "message": "Creator account created."
+            "message": "Creator account and organization created."
         }
 
     except (sqlite3.IntegrityError, psycopg.IntegrityError):
+        con.rollback()
         raise HTTPException(
             409,
             "An account with this email already exists."
@@ -623,7 +744,8 @@ def login_user(request: LoginRequest):
         "id": user["id"],
         "name": user["name"],
         "email": user["email"],
-        "role": user["role"]
+        "role": user["role"],
+        "organization_id": user["organization_id"]
     }
 
     return {
@@ -635,9 +757,125 @@ def login_user(request: LoginRequest):
 @app.get("/auth/me")
 def who_am_i(user=Depends(current_user)):
     return {"user": user}
+class CreateManagerRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=100)
+    email: str = Field(min_length=5, max_length=254)
+    password: str = Field(min_length=8, max_length=128)
 
-def active_id(con):
-    row = con.execute("SELECT setting_value FROM app_settings WHERE setting_key='active_guideline_id'").fetchone()
+
+@app.post("/organization/managers")
+def create_manager(
+    request: CreateManagerRequest,
+    user=Depends(current_user)
+):
+    if not DATABASE_URL:
+        raise HTTPException(
+            500,
+            "Manager account creation requires PostgreSQL."
+        )
+
+    organization_id = user.get("organization_id")
+
+    if not organization_id:
+        raise HTTPException(
+            400,
+            "Your account is not linked to an organization."
+        )
+
+    name = request.name.strip()
+    email = request.email.strip().lower()
+
+    if len(name) < 2:
+        raise HTTPException(400, "Enter a valid name.")
+
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(400, "Enter a valid email address.")
+
+    con = get_connection()
+
+    try:
+        # Lock this organization's row to prevent simultaneous
+        # Creator requests from creating multiple first managers.
+        organization = con.execute(
+            "SELECT id FROM organizations WHERE id=%s FOR UPDATE",
+            (organization_id,)
+        ).fetchone()
+
+        if not organization:
+            raise HTTPException(404, "Organization not found.")
+
+        existing_manager = con.execute("""
+            SELECT id
+            FROM users
+            WHERE organization_id=%s AND role='manager'
+            LIMIT 1
+        """, (organization_id,)).fetchone()
+
+        # A Creator may create the first manager only.
+        # Existing Managers may create additional Managers.
+        if user["role"] != "manager" and existing_manager:
+            raise HTTPException(
+                403,
+                "A Brand Manager already exists. Only an existing Brand Manager can create additional manager accounts."
+            )
+
+        created_at = datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        )
+
+        new_user = con.execute("""
+            INSERT INTO users (
+                name, email, password_hash, role,
+                created_at, organization_id
+            )
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id, name, email, role, organization_id
+        """, (
+            name,
+            email,
+            hash_password(request.password),
+            "manager",
+            created_at,
+            organization_id
+        )).fetchone()
+
+        con.commit()
+
+        return {
+            "message": "Brand Manager account created successfully.",
+            "user": dict(new_user)
+        }
+
+    except HTTPException:
+        con.rollback()
+        raise
+
+    except psycopg.IntegrityError:
+        con.rollback()
+        raise HTTPException(
+            409,
+            "An account with this email already exists."
+        )
+
+    except Exception:
+        con.rollback()
+        raise
+
+    finally:
+        con.close()
+
+def active_id(con, organization_id):
+    row = execute_query(
+        con,
+        """
+        SELECT setting_value
+        FROM organization_settings
+        WHERE organization_id = ?
+        AND setting_key = 'active_guideline_id'
+        """,
+        (organization_id,)
+    ).fetchone()
+
     return int(row["setting_value"]) if row else None
 
 def row_to_guideline(row, selected):
@@ -653,14 +891,18 @@ def row_to_guideline(row, selected):
             "created_at": row["created_at"], "is_active": row["id"] == selected}
 
 
-def read_brand_guidelines():
+def read_brand_guidelines(organization_id):
     con = get_connection()
-    selected = active_id(con)
+    selected = active_id(con, organization_id)
 
     row = execute_query(
         con,
-        "SELECT * FROM brand_guideline_versions WHERE id=?",
-        (selected,)
+        """
+        SELECT *
+        FROM brand_guideline_versions
+        WHERE id = ? AND organization_id = ?
+        """,
+        (selected, organization_id)
     ).fetchone() if selected is not None else None
 
     con.close()
@@ -673,18 +915,31 @@ def read_brand_guidelines():
 
 @app.get("/brand-guidelines")
 def get_brand_guidelines(user=Depends(manager_only)):
-    return read_brand_guidelines()
+    return read_brand_guidelines(user["organization_id"])
 
 @app.get("/brand-guidelines/history")
 def get_brand_guideline_history(user=Depends(manager_only)):
     con = get_connection()
-    selected = active_id(con)
-    rows = con.execute("SELECT * FROM brand_guideline_versions ORDER BY id DESC").fetchall()
+    selected = active_id(con, user["organization_id"])
+
+    rows = execute_query(
+        con,
+        """
+        SELECT *
+        FROM brand_guideline_versions
+        WHERE organization_id = ?
+        ORDER BY id DESC
+        """,
+        (user["organization_id"],)
+    ).fetchall()
+
     con.close()
-    return {"guidelines": [row_to_guideline(r, selected) for r in rows]}
 
-@app.post("/brand-guidelines")
-
+    return {
+        "guidelines": [
+            row_to_guideline(r, selected) for r in rows
+        ]
+    }
 @app.post("/brand-guidelines")
 def create_brand_guidelines(g: BrandGuidelinesRequest, user=Depends(manager_only)):
     if not g.brand_name.strip():
@@ -708,19 +963,25 @@ def create_brand_guidelines(g: BrandGuidelinesRequest, user=Depends(manager_only
         cur = con.execute("""
             INSERT INTO brand_guideline_versions
             (brand_name,tone_of_voice,approved_colors,restricted_terms,
-             approved_claims,approved_terms,required_terms,brand_facts,created_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+             approved_claims,approved_terms,required_terms,brand_facts,
+             created_at,organization_id)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             RETURNING id
-        """, values)
+        """, values + (user["organization_id"],))
 
         new_id = cur.fetchone()["id"]
 
         con.execute("""
-            INSERT INTO app_settings(setting_key,setting_value)
-            VALUES (%s,%s)
-            ON CONFLICT(setting_key)
-            DO UPDATE SET setting_value=EXCLUDED.setting_value
-        """, ("active_guideline_id", str(new_id)))
+            INSERT INTO organization_settings
+                (organization_id, setting_key, setting_value)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (organization_id, setting_key)
+            DO UPDATE SET setting_value = EXCLUDED.setting_value
+        """, (
+            user["organization_id"],
+            "active_guideline_id",
+            str(new_id)
+        ))
 
     else:
         cur = con.execute("""
@@ -753,7 +1014,7 @@ def update_brand_guidelines(g: BrandGuidelinesRequest, user=Depends(manager_only
         raise HTTPException(400, "Brand name cannot be empty.")
 
     con = get_connection()
-    selected = active_id(con)
+    selected = active_id(con, user["organization_id"])
 
     if selected is None:
         con.close()
@@ -765,7 +1026,7 @@ def update_brand_guidelines(g: BrandGuidelinesRequest, user=Depends(manager_only
         SET brand_name=?, tone_of_voice=?, approved_colors=?,
         restricted_terms=?, approved_claims=?, approved_terms=?,
         required_terms=?, brand_facts=?
-        WHERE id=?""",
+        WHERE id=? AND organization_id=?""",
         (
             g.brand_name.strip(),
             g.tone_of_voice.strip(),
@@ -775,7 +1036,8 @@ def update_brand_guidelines(g: BrandGuidelinesRequest, user=Depends(manager_only
             json.dumps(g.approved_terms),
             json.dumps(g.required_terms),
             json.dumps(g.brand_facts),
-            selected
+            selected,
+            user["organization_id"]
         )
     )
 
@@ -801,13 +1063,18 @@ async def upload_brand_logo(file: UploadFile = File(...), user=Depends(manager_o
             im.verify()
     except Exception:
         raise HTTPException(400, "The uploaded logo image is invalid.")
-    con = get_connection(); selected = active_id(con)
+    con = get_connection()
+    selected = active_id(con, user["organization_id"])
     if selected is None:
         con.close(); raise HTTPException(404, "No active brand profile found. Save a profile first.")
     execute_query(
         con,
-        "UPDATE brand_guideline_versions SET logo_data=?,logo_filename=?,logo_mime_type=? WHERE id=?",
-        (data, file.filename or "brand-logo", file.content_type, selected)
+        """
+    UPDATE brand_guideline_versions
+    SET logo_data=?, logo_filename=?, logo_mime_type=`?
+    WHERE id=? AND organization_id=?
+    """,
+        (data, file.filename or "brand-logo", file.content_type, selected, user["organization_id"])
     )
     con.commit(); con.close()
     return {"message":"Brand logo uploaded successfully.", "filename":file.filename or "brand-logo"}
@@ -815,7 +1082,7 @@ async def upload_brand_logo(file: UploadFile = File(...), user=Depends(manager_o
 @app.delete("/brand-guidelines/logo")
 def delete_brand_logo(user=Depends(manager_only)):
     con = get_connection()
-    selected = active_id(con)
+    selected = active_id(con, user["organization_id"])
 
     if selected is None:
         con.close()
@@ -825,8 +1092,8 @@ def delete_brand_logo(user=Depends(manager_only)):
         con,
         """UPDATE brand_guideline_versions
         SET logo_data=NULL, logo_filename='', logo_mime_type=''
-        WHERE id=?""",
-        (selected,)
+        WHERE id=? AND organization_id=?""",
+        (selected, user["organization_id"])
     )
 
     con.commit()
@@ -838,29 +1105,33 @@ def delete_brand_logo(user=Depends(manager_only)):
 @app.post("/brand-guidelines/{guideline_id}/activate")
 def activate_guideline(guideline_id: int, user=Depends(manager_only)):
     con = get_connection()
+    organization_id = user["organization_id"]
 
     guideline = execute_query(
         con,
-        "SELECT id FROM brand_guideline_versions WHERE id=?",
-        (guideline_id,)
+        """
+        SELECT id
+        FROM brand_guideline_versions
+        WHERE id=? AND organization_id=?
+        """,
+        (guideline_id, organization_id)
     ).fetchone()
 
     if not guideline:
         con.close()
         raise HTTPException(404, "Guideline version not found.")
 
-    if DATABASE_URL:
-        con.execute("""
-            INSERT INTO app_settings(setting_key,setting_value)
-            VALUES (%s,%s)
-            ON CONFLICT(setting_key)
-            DO UPDATE SET setting_value=EXCLUDED.setting_value
-        """, ("active_guideline_id", str(guideline_id)))
-    else:
-        con.execute("""
-            INSERT OR REPLACE INTO app_settings
-            VALUES ('active_guideline_id',?)
-        """, (str(guideline_id),))
+    execute_query(
+        con,
+        """
+        INSERT INTO organization_settings
+            (organization_id, setting_key, setting_value)
+        VALUES (?, ?, ?)
+        ON CONFLICT (organization_id, setting_key)
+        DO UPDATE SET setting_value = EXCLUDED.setting_value
+        """,
+        (organization_id, "active_guideline_id", str(guideline_id))
+    )
 
     con.commit()
     con.close()
@@ -879,9 +1150,9 @@ def _contains_phrase(text: str, phrase: str) -> bool:
         return False
     return re.search(r"(?<![a-z0-9])" + re.escape(phrase) + r"(?![a-z0-9])", text) is not None
 
-def check_brand_compliance(text):
+def check_brand_compliance(text, organization_id):
     """Rule-based first-pass checker. Findings are suggestions for human review, not verdicts."""
-    guidelines = read_brand_guidelines()
+    guidelines = read_brand_guidelines(organization_id)
     clean = _normalise_phrase(text)
     words = clean.split()
     issues = []
@@ -986,9 +1257,10 @@ def check_brand_compliance(text):
                 "Rewrite this sentence to match the brand's stated tone. Review the full sentence in context.")
 
     return issues
-
-
-def save_review(kind, submitted, extracted, issues, user_id, filename="", image_data=None, readability=None):
+def save_review(
+    kind, submitted, extracted, issues, user_id,
+    organization_id, filename="", image_data=None, readability=None
+):
     con = get_connection()
 
     values = (
@@ -1002,43 +1274,63 @@ def save_review(kind, submitted, extracted, issues, user_id, filename="", image_
         image_data,
         datetime.now().astimezone().isoformat(timespec="seconds"),
         user_id,
+        organization_id,
         json.dumps(readability or {})
     )
+
     if DATABASE_URL:
         cur = con.execute("""
-            INSERT INTO content_reviews(content_type,submitted_content,extracted_text,issues_json,total_issues,analysis_status,image_filename,image_data,created_at,user_id,readability_json)VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)RETURNING id""", values)
+            INSERT INTO content_reviews(
+                content_type, submitted_content, extracted_text,
+                issues_json, total_issues, analysis_status,
+                image_filename, image_data, created_at,
+                user_id, organization_id, readability_json
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id
+        """, values)
         rid = cur.fetchone()["id"]
     else:
         cur = con.execute("""
-            INSERT INTO content_reviews (content_type,submitted_content,extracted_text,issues_json,total_issues,analysis_status,image_filename,image_data,created_at,user_id,readability_json)VALUES (?,?,?,?,?,?,?,?,?,?,?)""", values)
+            INSERT INTO content_reviews(
+                content_type, submitted_content, extracted_text,
+                issues_json, total_issues, analysis_status,
+                image_filename, image_data, created_at,
+                user_id, organization_id, readability_json
+            )
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        """, values)
         rid = cur.lastrowid
 
     con.commit()
     con.close()
-
     return rid
-
 @app.get("/reviews")
 def get_reviews(user=Depends(current_user)):
     con = get_connection()
 
     if user["role"] == "manager":
-        rows = execute_query(con, """
-            SELECT id,content_type,submitted_content,extracted_text,
-            issues_json,total_issues,analysis_status,decision,
-            reviewer_note,image_filename,created_at,readability_json
+        rows = execute_query(
+            con,
+            """
+            SELECT *
             FROM content_reviews
+            WHERE organization_id=?
             ORDER BY id DESC
-        """).fetchall()
+            """,
+            (user["organization_id"],)
+        ).fetchall()
     else:
-        rows = execute_query(con, """
-            SELECT id,content_type,submitted_content,extracted_text,
-            issues_json,total_issues,analysis_status,decision,
-            reviewer_note,image_filename,created_at,readability_json
+        rows = execute_query(
+            con,
+            """
+            SELECT *
             FROM content_reviews
-            WHERE user_id=?
+            WHERE organization_id=? AND user_id=?
             ORDER BY id DESC
-        """, (user["id"],)).fetchall()
+            """,
+            (user["organization_id"], user["id"])
+        ).fetchall()
 
     con.close()
 
@@ -1061,9 +1353,6 @@ def get_reviews(user=Depends(current_user)):
             for r in rows
         ]
     }
-
-
-
 @app.delete("/reviews/{review_id}")
 def delete_review(review_id: int, user=Depends(current_user)):
     con = get_connection()
@@ -1071,42 +1360,45 @@ def delete_review(review_id: int, user=Depends(current_user)):
     if user["role"] == "manager":
         cur = execute_query(
             con,
-            "DELETE FROM content_reviews WHERE id=?",
-            (review_id,)
+            "DELETE FROM content_reviews WHERE id=? AND organization_id=?",
+            (review_id, user["organization_id"])
         )
     else:
         cur = execute_query(
             con,
-            "DELETE FROM content_reviews WHERE id=? AND user_id=?",
-            (review_id, user["id"])
+            """DELETE FROM content_reviews
+               WHERE id=? AND user_id=? AND organization_id=?""",
+            (review_id, user["id"], user["organization_id"])
         )
 
     if cur.rowcount == 0:
         con.close()
-        raise HTTPException(
-            404,
-            "Review not found or you do not have permission to delete it."
-        )
+        raise HTTPException(404, "Review not found or access denied.")
 
     con.commit()
     con.close()
-
-    return {
-        "message": "Review deleted successfully.",
-        "review_id": review_id
-    }
-
+    return {"message": "Review deleted successfully.", "review_id": review_id}
 
 
 @app.delete("/reviews")
 def clear_reviews(user=Depends(manager_only)):
-    con = get_connection(); con.execute("DELETE FROM content_reviews"); con.commit(); con.close()
-    return {"message": "Review history cleared. Brand guidelines were not changed."}
+    con = get_connection()
 
+    execute_query(
+        con,
+        "DELETE FROM content_reviews WHERE organization_id=?",
+        (user["organization_id"],)
+    )
 
+    con.commit()
+    con.close()
+
+    return {"message": "Organization review history cleared."}
 
 
 @app.patch("/reviews/{review_id}/decision")
+
+
 def update_review_decision(
     review_id: int,
     request: ReviewDecisionRequest,
@@ -1119,8 +1411,17 @@ def update_review_decision(
 
     cur = execute_query(
         con,
-        "UPDATE content_reviews SET decision=?, reviewer_note=? WHERE id=?",
-        (request.decision, request.reviewer_note, review_id)
+        """
+        UPDATE content_reviews
+        SET decision=?, reviewer_note=?
+        WHERE id=? AND organization_id=?
+        """,
+        (
+            request.decision,
+            request.reviewer_note,
+            review_id,
+            user["organization_id"]
+        )
     )
 
     if cur.rowcount == 0:
@@ -1144,18 +1445,34 @@ def get_analytics(user=Depends(current_user)):
     if user["role"] == "manager":
         rows = execute_query(
             con,
-            "SELECT decision, content_type, total_issues, issues_json, created_at FROM content_reviews"
+            """
+            SELECT decision, content_type, total_issues,
+                   issues_json, created_at
+            FROM content_reviews
+            WHERE organization_id=?
+            """,
+            (user["organization_id"],)
         ).fetchall()
     else:
         rows = execute_query(
             con,
-            "SELECT decision, content_type, total_issues, issues_json, created_at FROM content_reviews WHERE user_id=?",
-            (user["id"],)
+            """
+            SELECT decision, content_type, total_issues,
+                   issues_json, created_at
+            FROM content_reviews
+            WHERE organization_id=? AND user_id=?
+            """,
+            (user["organization_id"], user["id"])
         ).fetchall()
 
     con.close()
 
-    decisions = {"Pending": 0, "Approved": 0, "Revision Requested": 0, "Rejected": 0}
+    decisions = {
+        "Pending": 0,
+        "Approved": 0,
+        "Revision Requested": 0,
+        "Rejected": 0
+    }
     types = {"Text": 0, "Image": 0}
     severity = {"high": 0, "medium": 0, "low": 0}
     daily = {}
@@ -1195,6 +1512,7 @@ def get_analytics(user=Depends(current_user)):
             for k, v in sorted(daily.items())[-7:]
         ]
     }
+
 
 
 @app.get("/")
@@ -1411,13 +1729,13 @@ def analyze_content(request: ContentRequest, user=Depends(current_user)):
         raise HTTPException(400, "Please enter content to analyze.")
 
     # Existing rule-based analysis
-    issues = check_brand_compliance(content)
+    issues = check_brand_compliance(content, user["organization_id"])
 
     for issue in issues:
         issue["source"] = "Rule-based"
 
     # Gemini AI analysis
-    ai_issues = analyze_with_gemini(content)
+    ai_issues = analyze_with_gemini(content, user["organization_id"])
 
     existing_messages = {
         issue.get("message", "").strip().lower()
@@ -1439,7 +1757,10 @@ def analyze_content(request: ContentRequest, user=Depends(current_user)):
             "suggestion": "Provide more information."
         })
 
-    rid = save_review("Text", content, "", issues, user["id"])
+    rid = save_review(
+    "Text", content, "", issues,
+    user["id"], user["organization_id"]
+)
 
     return {
         "review_id": rid,
@@ -1683,7 +2004,7 @@ def assess_poster_readability(image_array, ocr_results):
         )
     }
 
-def analyze_with_gemini(content):
+def analyze_with_gemini(content, organization_id):
     """Use Gemini to provide additional brand-content analysis."""
 
     api_key = os.getenv("GEMINI_API_KEY")
@@ -1693,8 +2014,7 @@ def analyze_with_gemini(content):
         return []
 
     try:
-        guidelines = read_brand_guidelines()
-
+        guidelines = read_brand_guidelines(organization_id)
         if not guidelines:
             return []
 
@@ -2283,14 +2603,14 @@ async def analyze_image(file: UploadFile = File(...), user=Depends(current_user)
             ocr_method = "No text detected"
 
         # Step 2: Existing rule-based analysis
-        issues = check_brand_compliance(extracted)
+        issues = check_brand_compliance(extracted, user["organization_id"])
 
         for issue in issues:
             issue["source"] = "Rule-based"
 
         # Step 3: Gemini AI analysis
         if extracted.strip():
-            ai_issues = analyze_with_gemini(extracted)
+            ai_issues = analyze_with_gemini(extracted, user["organization_id"])
 
             existing_messages = {
                 issue.get("message", "").strip().lower()
@@ -2307,7 +2627,7 @@ async def analyze_image(file: UploadFile = File(...), user=Depends(current_user)
 
         # Step 4: Check poster readability and brand colours
         readability = assess_poster_readability(image_array, results)
-        guidelines = read_brand_guidelines()
+        guidelines = read_brand_guidelines(user["organization_id"])
 
         color_analysis = analyze_brand_colors(
             image_array,
@@ -2330,13 +2650,16 @@ async def analyze_image(file: UploadFile = File(...), user=Depends(current_user)
         # Step 5: Load active brand logo and guidelines
         con = get_connection()
         try:
-            selected = active_id(con)
+            selected = active_id(con, user["organization_id"])
 
             logo_row = execute_query(
                 con,
-                "SELECT brand_name, logo_data, logo_filename "
-                "FROM brand_guideline_versions WHERE id=?",
-                (selected,)
+                """
+                SELECT brand_name, logo_data, logo_filename
+                FROM brand_guideline_versions
+                WHERE id=? AND organization_id=?
+                """,
+                (selected, user["organization_id"])
             ).fetchone() if selected is not None else None
 
         finally:
@@ -2417,6 +2740,7 @@ async def analyze_image(file: UploadFile = File(...), user=Depends(current_user)
             extracted,
             issues,
             user["id"],
+            user["organization_id"],
             file.filename or "uploaded-image",
             data,
             readability
