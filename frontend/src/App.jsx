@@ -47,9 +47,49 @@ export default function App() {
   const [isNewGuideline,setIsNewGuideline] = useState(false);
   const [message,setMessage] = useState("");
   const [error,setError] = useState("");
-  const fileRef = useRef(null);
 
-  async function request(path, options={}) {
+  const fileRef = useRef(null);
+  async function createManager(event) {
+  event.preventDefault();
+  setError("");
+  setMessage("");
+  setManagerBusy(true);
+
+  try {
+    const data = await request("/organization/managers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: managerName,
+        email: managerEmail,
+        password: managerPassword
+      })
+    });
+
+    setMessage(
+      `Brand Manager account created for ${data.user.name}. They can now log in using the normal login page.`
+    );
+
+    setManagerName("");
+    setManagerEmail("");
+    setManagerPassword("");
+
+} catch (err) {
+  const errorText = err?.message ?? err?.detail ?? err;
+
+  setError(
+    typeof errorText === "string"
+      ? errorText
+      : JSON.stringify(errorText, null, 2)
+  );
+}
+finally {
+  setManagerBusy(false);
+}
+}
+
+// Keep this function outside createManager
+async function request(path, options={}) {
     const headers = new Headers(options.headers || {});
     const activeToken = localStorage.getItem(TOKEN_KEY);
     if (activeToken) headers.set("Authorization", `Bearer ${activeToken}`);
@@ -110,8 +150,7 @@ export default function App() {
     } catch(e) { setError(e.message); }
     finally { setAuthBusy(false); }
   }
-
-  function logout(showMessage=true) {
+function logout(showMessage=true) {
     localStorage.removeItem(TOKEN_KEY); setToken(""); setUser(null);
     setHistory([]); setGuidelineHistory([]); setGuideline(blankGuideline);
     setText(""); setTextReport(null); setImage(null); setImageReport(null);
@@ -451,8 +490,12 @@ function aiSummary(issues = []) {
   </div></div>;
 
   const isManager=user.role==="manager";
-  const nav=[["Dashboard",LayoutDashboard],["Content Review",FileSearch],...(isManager?[["Brand Guidelines",BookOpen]]:[]),["Review History",History]];
-  const pendingCount=history.filter(r=>!r.decision||r.decision==="Pending Human Review").length;
+const nav = [
+  ["Dashboard", LayoutDashboard],
+  ["Content Review", FileSearch],
+  ...(isManager ? [["Brand Guidelines", BookOpen]] : []),
+  ["Review History", History]
+];  const pendingCount=history.filter(r=>!r.decision||r.decision==="Pending Human Review").length;
   const totalIssues=history.reduce((n,r)=>n+Number(r.total_issues||0),0);
 
   function renderDashboard() {
@@ -624,7 +667,17 @@ function aiSummary(issues = []) {
       <div className="sidebar-foot">Brand governance workspace<br/>AI-assisted · Human-approved</div>
     </aside>
     <main className="main">
-      <header className="topbar"><div><h1>{page}</h1><p className="sub">{page==="Dashboard"?"Monitor and protect your organisation's brand identity.":page==="Content Review"?"Check text and visual content before publishing.":page==="Brand Guidelines"?"Create and manage approved brand rules.":"Saved submissions and final reviewer decisions."}</p></div>
+      <header className="topbar"><div><h1>{page}</h1><p className="sub">
+    {page === "Dashboard"
+    ? "Monitor and protect your organisation's brand identity."
+    : page === "Manager Accounts"
+    ? "Create and manage organization manager access."
+    : page === "Content Review"
+    ? "Check text and visual content before publishing."
+    : page === "Brand Guidelines"
+    ? "Create and manage approved brand rules."
+    : "Saved submissions and final reviewer decisions."}
+</p></div>
         <div className="top-actions"><span className="role-label">{isManager?"Brand Manager / Reviewer":"Content Creator"} · {user.name}</span>{page==="Content Review"&&<button className="btn light" onClick={newAnalysis}><Plus size={16}/>New Analysis</button>}<button className="btn light" onClick={()=>logout()}><LogOut size={15}/>Log out</button></div>
       </header>
       {message&&<div className="notice ok">{message}</div>}{error&&<div className="notice err">{error}</div>}
@@ -851,39 +904,391 @@ function aiSummary(issues = []) {
 })()}
 </>}
 
-      {page==="Brand Guidelines"&&isManager&&<>
-        <section className="panel"><div className="panel-head"><div><h2>{isNewGuideline?"Add a new brand profile":"Active brand profile"}</h2><p>{isNewGuideline?"Saving creates a separate profile and activates it.":"These rules are used by the compliance checker."}</p></div><button className="btn primary" onClick={startNewGuideline}><Plus size={16}/>Add New Brand Guideline</button></div>
-          {guidelineBusy?<div className="empty">Loading brand guidelines...</div>:<form onSubmit={saveGuideline}>
-            <div className="field"><label>Brand name</label><textarea rows="2" value={guideline.brand_name} onChange={e=>editField("brand_name",e.target.value)} placeholder="e.g. GreenBite Food or GreenBite\nFOODS"/></div>
-            <div className="field"><label>Brand logo (optional)</label><div className="logo-upload-row">{guideline.logo_url&&!pendingLogo?<img className="brand-logo-preview" src={guideline.logo_url} alt="Current brand logo"/>:pendingLogo?<div className="brand-logo-placeholder">{pendingLogo.name}</div>:<div className="brand-logo-placeholder">No logo uploaded</div>}<div className="logo-actions"><label className="btn light">{guideline.logo_url||pendingLogo?"Replace logo":"Upload logo"}<input type="file" accept="image/png,image/jpeg,image/webp" onChange={chooseLogo} hidden/></label>{(guideline.logo_url||pendingLogo)&&<button type="button" className="btn danger" onClick={()=>{if(pendingLogo){setPendingLogo(null);}else{removeLogo();}}}>Remove</button>}<small className="muted">PNG, JPG or WebP · Maximum 2 MB. The logo is stored with this brand profile.</small></div></div></div>
-            <div className="field"><label>Tone of voice</label><textarea rows="3" value={guideline.tone_of_voice} onChange={e=>editField("tone_of_voice",e.target.value)} placeholder="Professional, friendly and trustworthy"/></div>
-            <div className="split"><div className="field"><label>Approved brand colours (one per line)</label><textarea rows="4" value={guideline.approved_colors.join("\n")} onChange={e=>editField("approved_colors",lines(e.target.value))} placeholder="#0F766E&#10;#172554&#10;#FFFFFF"/></div><div className="field"><label>Restricted terms (one per line)</label><textarea rows="4" value={guideline.restricted_terms.join("\n")} onChange={e=>editField("restricted_terms",lines(e.target.value))} placeholder="guaranteed&#10;100% free"/></div></div>
-            <div className="field"><label>Approved claims / phrases (one per line)</label><textarea rows="3" value={guideline.approved_claims.join("\n")} onChange={e=>editField("approved_claims",lines(e.target.value))} placeholder="Quality products"/></div>
-            <div className="field"><label>Preferred terminology (one mapping per line: old term -&gt; preferred term)</label><textarea rows="3" value={guideline.approved_terms.join("\n")} onChange={e=>editField("approved_terms",lines(e.target.value))} placeholder="clients -&gt; customers&#10;cheap -&gt; affordable"/><small className="muted">The checker flags the old term and suggests the preferred wording.</small></div>
-            <div className="field"><label>Required brand terms or phrases (one per line)</label><textarea rows="3" value={guideline.required_terms.join("\n")} onChange={e=>editField("required_terms",lines(e.target.value))} placeholder="Official brand name&#10;Approved campaign tagline"/><small className="muted">Use only when the phrase genuinely needs to appear in every type of content being checked.</small></div>
-            <div className="field"><label>Verified brand facts (one approved fact per line)</label><textarea rows="4" value={guideline.brand_facts.join("\n")} onChange={e=>editField("brand_facts",lines(e.target.value))} placeholder="Founded in 2018&#10;Head office is in Hyderabad&#10;Certified under ISO 9001"/><small className="muted">Use facts that have been verified by your organisation. The checker uses these as context when flagging factual claims.</small></div>
-            <div className="inline"><button className="btn primary" type="submit" disabled={guidelineSaving}><BookOpen size={16}/>{guidelineSaving?"Saving...":isNewGuideline?"Save and activate new profile":"Save changes"}</button>{isNewGuideline&&<button type="button" className="btn light" onClick={loadGuidelines}>Cancel</button>}</div>
-          </form>}</section>
-        <section className="panel"><div className="panel-head"><div><h2>Brand guideline history</h2><p>Previous profiles are kept. Activate one to use its rules.</p></div><button className="btn light" onClick={loadGuidelineHistory}><RefreshCw size={15}/>Refresh</button></div>
-          {guidelineHistory.length?<div className="table-wrap"><table className="history-table"><thead><tr><th>Profile ID</th><th>Brand name</th><th>Tone</th><th>Created</th><th>Status</th><th>Action</th></tr></thead><tbody>{guidelineHistory.map(g=><tr key={g.id}><td>#{g.id}</td><td>{g.brand_name}</td><td>{g.tone_of_voice||"—"}</td><td>{dateText(g.created_at)}</td><td>{g.is_active?"Active":"Saved"}</td><td>{g.is_active?"Currently active":<button className="btn light" onClick={()=>activateGuideline(g.id)}><Power size={14}/>Activate</button>}</td></tr>)}</tbody></table></div>:<div className="empty">No guideline versions found.</div>}
-        </section>
-      </>}
-      {page==="Review History"&&<section className="panel"><div className="panel-head"><div><h2>Saved content reviews</h2><p>{isManager?"All team submissions and final reviewer decisions.":"Your saved submissions and their review status."}</p></div><div className="inline"><button className="btn light" onClick={loadHistory}><RefreshCw size={15}/>Refresh</button>{isManager&&<button className="btn danger" onClick={clearHistory}><Trash2 size={15}/>Clear History</button>}</div></div>
-        {historyBusy?<div className="empty">Loading review history...</div>:history.length?<div className="table-wrap"><table className="history-table"><thead><tr><th>Review ID / Type</th><th>Submitted content</th><th>Date</th><th>Issues</th><th>Final decision</th><th>Actions</th></tr></thead><tbody>{history.map(r=><tr key={r.id}><td>#{r.id}<br/><span className="muted">{r.type}</span></td><td>{r.type==="Image"?(r.submitted_content||r.image_filename||"Uploaded image"):(r.submitted_content||"").slice(0,180)}</td><td>{dateText(r.date)}</td><td>{r.total_issues}</td><td>{statusPill(r.decision)}</td><td><div className="actions"><button className="btn light" onClick={()=>{setSelectedReviewId(selectedReviewId===r.id?null:r.id);setHistoryReviewerNote(r.reviewer_note||"");}}>{selectedReviewId===r.id?"Close":"Review details"}</button><button className="btn danger" onClick={()=>deleteReview(r.id)}><Trash2 size={14}/>Delete</button></div></td></tr>)}</tbody></table></div>:<div className="empty"><History size={30}/><p>No saved reviews yet.</p></div>}
-        <div className="empty">
-  Reviews loaded: {history.length}
-</div>
-        {selectedReviewId && (()=>{const r=history.find(x=>x.id===selectedReviewId);if(!r)return null;return <section className="history-detail"><div className="panel-head"><div><h2>Review #{r.id} · {r.type}</h2><p>Submitted {dateText(r.date)} · {r.total_issues} detected issue(s)</p></div>{statusPill(r.decision)}</div>
+      {page === "Brand Guidelines" && isManager && (
+        <>
+          <section className="panel">
+            <div className="panel-head">
+              <div>
+                <h2>{isNewGuideline ? "Add a new brand profile" : "Active brand profile"}</h2>
+                <p>
+                  {isNewGuideline
+                    ? "Saving creates a separate profile and activates it."
+                    : "These rules are used by the compliance checker."}
+                </p>
+              </div>
+              <button className="btn primary" onClick={startNewGuideline}>
+                <Plus size={16} /> Add New Brand Guideline
+              </button>
+            </div>
 
-          {r.type==="Image"&&<><h3>Official logo check</h3>{logoMatchPanel(r.readability?.logo_match)}<h3>Poster / flyer readability analysis</h3>{readabilityPanel(r.readability)}<h3>Extracted text (OCR)</h3><div className="ocr">{r.extracted_text||"No text was detected."}</div></>}
-          {r.type!=="Image"&&<><h3>Submitted content</h3><div className="ocr">{r.submitted_content}</div></>}
-          <h3>Detected brand issues</h3>{issueTable(arr(r.issues))}
-          <h3>Reviewer note</h3><div className="ocr">{r.reviewer_note||"No reviewer note saved."}</div>
-          {isManager&&<div className="reviewer"><h3>Make / update final decision</h3><textarea rows="2" placeholder="Add a reviewer note (optional)" value={historyReviewerNote} onChange={e=>setHistoryReviewerNote(e.target.value)}/><div className="actions"><button className="btn success" onClick={()=>decideHistoryReview(r.id,"Approved")}><ThumbsUp size={15}/>Approve</button><button className="btn warning" onClick={()=>decideHistoryReview(r.id,"Revision Requested")}><RotateCcw size={15}/>Request revision</button><button className="btn danger" onClick={()=>decideHistoryReview(r.id,"Rejected")}><Ban size={15}/>Reject</button></div></div>}
-        </section>;})()}
-      </section>}
-    </main>
-  </div>;
+            {guidelineBusy ? (
+              <div className="empty">Loading brand guidelines...</div>
+            ) : (
+              <form onSubmit={saveGuideline}>
+                <div className="field">
+                  <label>Brand name</label>
+                  <textarea
+                    rows="2"
+                    value={guideline.brand_name}
+                    onChange={e => editField("brand_name", e.target.value)}
+                    placeholder={"e.g. GreenBite Food or GreenBite\nFOODS"}
+                  />
+                </div>
+
+                <div className="field">
+                  <label>Brand logo (optional)</label>
+                  <div className="logo-upload-row">
+                    {guideline.logo_url && !pendingLogo ? (
+                      <img className="brand-logo-preview" src={guideline.logo_url} alt="Current brand logo" />
+                    ) : pendingLogo ? (
+                      <div className="brand-logo-placeholder">{pendingLogo.name}</div>
+                    ) : (
+                      <div className="brand-logo-placeholder">No logo uploaded</div>
+                    )}
+
+                    <div className="logo-actions">
+                      <label className="btn light">
+                        {guideline.logo_url || pendingLogo ? "Replace logo" : "Upload logo"}
+                        <input
+                          type="file"
+                          accept="image/png,image/jpeg,image/webp"
+                          onChange={chooseLogo}
+                          hidden
+                        />
+                      </label>
+
+                      {(guideline.logo_url || pendingLogo) && (
+                        <button
+                          type="button"
+                          className="btn danger"
+                          onClick={() => {
+                            if (pendingLogo) {
+                              setPendingLogo(null);
+                            } else {
+                              removeLogo();
+                            }
+                          }}
+                        >
+                          Remove
+                        </button>
+                      )}
+
+                      <small className="muted">
+                        PNG, JPG or WebP · Maximum 2 MB. The logo is stored with this brand profile.
+                      </small>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="field">
+                  <label>Tone of voice</label>
+                  <textarea
+                    rows="3"
+                    value={guideline.tone_of_voice}
+                    onChange={e => editField("tone_of_voice", e.target.value)}
+                    placeholder="Professional, friendly and trustworthy"
+                  />
+                </div>
+
+                <div className="split">
+                  <div className="field">
+                    <label>Approved brand colours (one per line)</label>
+                    <textarea
+                      rows="4"
+                      value={guideline.approved_colors.join("\n")}
+                      onChange={e => editField("approved_colors", lines(e.target.value))}
+                      placeholder={"#0F766E\n#172554\n#FFFFFF"}
+                    />
+                  </div>
+
+                  <div className="field">
+                    <label>Restricted terms (one per line)</label>
+                    <textarea
+                      rows="4"
+                      value={guideline.restricted_terms.join("\n")}
+                      onChange={e => editField("restricted_terms", lines(e.target.value))}
+                      placeholder={"guaranteed\n100% free"}
+                    />
+                  </div>
+                </div>
+
+                <div className="field">
+                  <label>Approved claims / phrases (one per line)</label>
+                  <textarea
+                    rows="3"
+                    value={guideline.approved_claims.join("\n")}
+                    onChange={e => editField("approved_claims", lines(e.target.value))}
+                    placeholder="Quality products"
+                  />
+                </div>
+
+                <div className="field">
+                  <label>Preferred terminology (one mapping per line: old term -&gt; preferred term)</label>
+                  <textarea
+                    rows="3"
+                    value={guideline.approved_terms.join("\n")}
+                    onChange={e => editField("approved_terms", lines(e.target.value))}
+                    placeholder={"clients -> customers\ncheap -> affordable"}
+                  />
+                  <small className="muted">
+                    The checker flags the old term and suggests the preferred wording.
+                  </small>
+                </div>
+
+                <div className="field">
+                  <label>Required brand terms or phrases (one per line)</label>
+                  <textarea
+                    rows="3"
+                    value={guideline.required_terms.join("\n")}
+                    onChange={e => editField("required_terms", lines(e.target.value))}
+                    placeholder={"Official brand name\nApproved campaign tagline"}
+                  />
+                  <small className="muted">
+                    Use only when the phrase genuinely needs to appear in every type of content being checked.
+                  </small>
+                </div>
+
+                <div className="field">
+                  <label>Verified brand facts (one approved fact per line)</label>
+                  <textarea
+                    rows="4"
+                    value={guideline.brand_facts.join("\n")}
+                    onChange={e => editField("brand_facts", lines(e.target.value))}
+                    placeholder={"Founded in 2018\nHead office is in Hyderabad\nCertified under ISO 9001"}
+                  />
+                  <small className="muted">
+                    Use facts that have been verified by your organisation. The checker uses these as context when flagging factual claims.
+                  </small>
+                </div>
+
+                <div className="inline">
+                  <button className="btn primary" type="submit" disabled={guidelineSaving}>
+                    <BookOpen size={16} />
+                    {guidelineSaving
+                      ? "Saving..."
+                      : isNewGuideline
+                        ? "Save and activate new profile"
+                        : "Save changes"}
+                  </button>
+
+                  {isNewGuideline && (
+                    <button type="button" className="btn light" onClick={loadGuidelines}>
+                      Cancel
+                    </button>
+                  )}
+                </div>
+              </form>
+            )}
+          </section>
+
+          <section className="panel">
+            <div className="panel-head">
+              <div>
+                <h2>Brand guideline history</h2>
+                <p>Previous profiles are kept. Activate one to use its rules.</p>
+              </div>
+              <button className="btn light" onClick={loadGuidelineHistory}>
+                <RefreshCw size={15} /> Refresh
+              </button>
+            </div>
+
+            {guidelineHistory.length ? (
+              <div className="table-wrap">
+                <table className="history-table">
+                  <thead>
+                    <tr>
+                      <th>Profile ID</th>
+                      <th>Brand name</th>
+                      <th>Tone</th>
+                      <th>Created</th>
+                      <th>Status</th>
+                      <th>Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {guidelineHistory.map(g => (
+                      <tr key={g.id}>
+                        <td>#{g.id}</td>
+                        <td>{g.brand_name}</td>
+                        <td>{g.tone_of_voice || "—"}</td>
+                        <td>{dateText(g.created_at)}</td>
+                        <td>{g.is_active ? "Active" : "Saved"}</td>
+                        <td>
+                          {g.is_active ? (
+                            "Currently active"
+                          ) : (
+                            <button className="btn light" onClick={() => activateGuideline(g.id)}>
+                              <Power size={14} /> Activate
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="empty">No guideline versions found.</div>
+            )}
+          </section>
+        </>
+      )}
+
+      {page === "Review History" && (
+        <section className="panel">
+          <div className="panel-head">
+            <div>
+              <h2>Saved content reviews</h2>
+              <p>
+                {isManager
+                  ? "All team submissions and final reviewer decisions."
+                  : "Your saved submissions and their review status."}
+              </p>
+            </div>
+
+            <div className="inline">
+              <button className="btn light" onClick={loadHistory}>
+                <RefreshCw size={15} /> Refresh
+              </button>
+              {isManager && (
+                <button className="btn danger" onClick={clearHistory}>
+                  <Trash2 size={15} /> Clear History
+                </button>
+              )}
+            </div>
+          </div>
+
+          {historyBusy ? (
+            <div className="empty">Loading review history...</div>
+          ) : history.length ? (
+            <div className="table-wrap">
+              <table className="history-table">
+                <thead>
+                  <tr>
+                    <th>Review ID / Type</th>
+                    <th>Submitted content</th>
+                    <th>Date</th>
+                    <th>Issues</th>
+                    <th>Final decision</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {history.map(r => (
+                    <tr key={r.id}>
+                      <td>
+                        #{r.id}<br />
+                        <span className="muted">{r.type}</span>
+                      </td>
+                      <td>
+                        {r.type === "Image"
+                          ? r.submitted_content || r.image_filename || "Uploaded image"
+                          : (r.submitted_content || "").slice(0, 180)}
+                      </td>
+                      <td>{dateText(r.date)}</td>
+                      <td>{r.total_issues}</td>
+                      <td>{statusPill(r.decision)}</td>
+                      <td>
+                        <div className="actions">
+                          <button
+                            className="btn light"
+                            onClick={() => {
+                              setSelectedReviewId(selectedReviewId === r.id ? null : r.id);
+                              setHistoryReviewerNote(r.reviewer_note || "");
+                            }}
+                          >
+                            {selectedReviewId === r.id ? "Close" : "Review details"}
+                          </button>
+                          <button className="btn danger" onClick={() => deleteReview(r.id)}>
+                            <Trash2 size={14} /> Delete
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="empty">
+              <History size={30} />
+              <p>No saved reviews yet.</p>
+            </div>
+          )}
+
+          {selectedReviewId && (() => {
+            const r = history.find(x => x.id === selectedReviewId);
+            if (!r) return null;
+
+            return (
+              <section className="history-detail">
+                <div className="panel-head">
+                  <div>
+                    <h2>Review #{r.id} · {r.type}</h2>
+                    <p>
+                      Submitted {dateText(r.date)} · {r.total_issues} detected issue(s)
+                    </p>
+                  </div>
+                  {statusPill(r.decision)}
+                </div>
+
+                {r.type === "Image" && (
+                  <>
+                    <h3>Official logo check</h3>
+                    {logoMatchPanel(r.readability?.logo_match)}
+                    <h3>Poster / flyer readability analysis</h3>
+                    {readabilityPanel(r.readability)}
+                    <h3>Extracted text (OCR)</h3>
+                    <div className="ocr">
+                      {r.extracted_text || "No text was detected."}
+                    </div>
+                  </>
+                )}
+
+                {r.type !== "Image" && (
+                  <>
+                    <h3>Submitted content</h3>
+                    <div className="ocr">{r.submitted_content}</div>
+                  </>
+                )}
+
+                <h3>Detected brand issues</h3>
+                {issueTable(arr(r.issues))}
+
+                <h3>Reviewer note</h3>
+                <div className="ocr">
+                  {r.reviewer_note || "No reviewer note saved."}
+                </div>
+
+                {isManager && (
+                  <div className="reviewer">
+                    <h3>Make / update final decision</h3>
+                    <textarea
+                      rows="2"
+                      placeholder="Add a reviewer note (optional)"
+                      value={historyReviewerNote}
+                      onChange={e => setHistoryReviewerNote(e.target.value)}
+                    />
+                    <div className="actions">
+                      <button className="btn success" onClick={() => decideHistoryReview(r.id, "Approved")}>
+                        <ThumbsUp size={15} /> Approve
+                      </button>
+                      <button className="btn warning" onClick={() => decideHistoryReview(r.id, "Revision Requested")}>
+                        <RotateCcw size={15} /> Request revision
+                      </button>
+                      <button className="btn danger" onClick={() => decideHistoryReview(r.id, "Rejected")}>
+                        <Ban size={15} /> Reject
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </section>
+            );
+          })()}
+        </section>
+      )}
+  </main>
+  </div>
 }
 const styles = `
 *{box-sizing:border-box}body{margin:0;background:#f3f6fb;font-family:Inter,Segoe UI,Arial,sans-serif;color:#172554}button,input,textarea{font:inherit}
